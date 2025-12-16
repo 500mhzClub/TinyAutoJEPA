@@ -1,0 +1,36 @@
+# --- Large Data Files (DO NOT COMMIT) ---
+# These are your dataset and model weights. They are too big for GitHub.
+data/
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# --- Python ---
+# Compiled python files (garbage)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual Environments ---
+# Your local python sandbox
+venv/
+env/
+.env
+.venv/
+
+# --- IDE Settings (Optional but recommended) ---
+# User-specific settings for VS Code, PyCharm, etc.
+.vscode/
+.idea/
+*.swp
+
+# --- System ---
+.DS_Store
+Thumbs.db
+
+# --- Logs & Monitoring ---
+# If you add Tensorboard later
+runs/
+*.log
