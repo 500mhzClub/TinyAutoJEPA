@@ -6,17 +6,18 @@ from torchvision import transforms, models
 import numpy as np
 import glob
 import os
+import sys
 from tqdm import tqdm
 from vicreg import vicreg_loss
 
 # --- CONFIG ---
 BATCH_SIZE = 256
 EPOCHS = 50
-LEARNING_RATE = 3e-4 # Standard VICReg rate
+# Lower learning rate slightly to ensure stability at start
+LEARNING_RATE = 1e-4 
 DEVICE = "cuda"
 
-# --- AUGMENTATION (GPU - Eager Mode) ---
-# We will NOT compile this class. It runs fast enough in eager mode.
+# --- AUGMENTATION (GPU) ---
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
@@ -25,7 +26,6 @@ class GPUAugment(nn.Module):
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-            # Normalization helps prevent NaNs by keeping inputs centered
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
@@ -38,7 +38,6 @@ class CarRacingDataset(Dataset):
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
-        # Load all chunks
         for f in tqdm(files, desc="Loading Chunks"):
             try:
                 data = np.load(f)
@@ -50,7 +49,6 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        # Transpose to (N, 3, 64, 64)
         self.images = np.transpose(self.images, (0, 3, 1, 2))
         
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
@@ -59,18 +57,15 @@ class CarRacingDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # Return raw uint8 to speed up transfer to GPU
         return torch.from_numpy(self.images[idx])
 
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Encoder
         resnet = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
         
-        # Projector
         self.projector = nn.Sequential(
             nn.Linear(self.feature_dim, 2048),
             nn.BatchNorm1d(2048),
@@ -87,69 +82,56 @@ class VICRegModel(nn.Module):
         z = self.projector(h)        
         return h, z
 
-# --- TRAINING LOOP ---
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # 8 Workers for fast data loading
     dataset = CarRacingDataset("data")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     
     model = VICRegModel().to(DEVICE)
     augmentor = GPUAugment().to(DEVICE)
     
-    # FIX: Compile ONLY the model, NOT the augmentor
-    # The augmentor was causing the "Graph Breaks" and slowing things down.
-    try:
-        print("Compiling ResNet Model (Standard Mode)...")
-        model = torch.compile(model)
-    except Exception as e:
-        print(f"Compilation skipped: {e}")
-
+    # NOTE: We intentionally avoid torch.compile and AMP (BFloat16)
+    # to guarantee mathematical stability on the new architecture.
+    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
-    scaler = torch.amp.GradScaler("cuda")
 
-    print(f"Starting training on {DEVICE}...")
+    print(f"Starting training on {DEVICE} (Pure Float32 Mode)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for batch_imgs in pbar:
-            # 1. Move to GPU
-            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
+        for i, batch_imgs in enumerate(pbar):
+            # 1. Move to GPU & Convert to Float32
+            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True).float() / 255.0
             
-            # 2. Convert to Float
-            batch_imgs = batch_imgs.float() / 255.0
+            # SANITY CHECK: If inputs are bad, stop immediately
+            if torch.isnan(batch_imgs).any():
+                print("CRITICAL ERROR: Input data contains NaNs!")
+                sys.exit(1)
+
+            # 2. Augment (Float32)
+            view_1 = augmentor(batch_imgs)
+            view_2 = augmentor(batch_imgs)
             
-            # 3. Augment (Eager Mode - No Compiler Issues)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                view_1 = augmentor(batch_imgs)
-                view_2 = augmentor(batch_imgs)
-                
-                # 4. Forward Pass
-                _, z1 = model(view_1)
-                _, z2 = model(view_2)
-                
-                # FIX: Force Loss Calculation to Float32 to prevent NaN
-                loss = vicreg_loss(z1.float(), z2.float())
+            # 3. Forward Pass (Float32)
+            _, z1 = model(view_1)
+            _, z2 = model(view_2)
             
+            loss = vicreg_loss(z1, z2)
+            
+            # 4. Check Loss Validity
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\nPANIC: Loss exploded at Epoch {epoch+1}, Batch {i}!")
+                print("This usually means the Learning Rate is too high.")
+                sys.exit(1) # Stop the script entirely
+
             # 5. Backward Pass
-            scaler.scale(loss).backward()
-            
-            # FIX: Gradient Clipping (Prevents Exploding Gradients)
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
             optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             
-            # Check for NaN again just in case
-            if torch.isnan(loss):
-                print("PANIC: Loss is NaN! Reducing LR or checking data...")
-                break
-                
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
