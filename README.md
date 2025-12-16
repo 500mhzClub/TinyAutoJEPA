@@ -112,8 +112,16 @@ We use the trained JEPA to evaluate "Energy" (Compatibility).
 
 ## Quick Start1. **Generate Data (Machine A):**
 ```bash
+sudo apt install swig build-essential python3-dev
+
+python3 -m venv venv
+
+source venv/bin/activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+
 python collect_data.py
-# Copy /data folder to Machine B
 
 ```
 
