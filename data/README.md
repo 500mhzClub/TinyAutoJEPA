@@ -8,16 +8,17 @@ Linux (Ubuntu/Debian) - Recommended
 ```bash
 sudo apt-get update
 sudo apt-get install swig build-essential python3-dev
-
+```
 
 # 2. Install the python libraries
+```bash
 pip install "gymnasium[box2d]" numpy opencv-python
 ```
+# 3. R-sync to copy training data between machines
+```bash
+rsync -avz --progress data/ andrewknowles@pop-os-9060xt:~/Workspace/TinyAutoJEPA/data/
+```
 ---
-
-#2. The Data Generation Script (collect_data.py)
-
-Save this file as collect_data.py on the 5950X machine.
 
 Key Features of this Script:
 
