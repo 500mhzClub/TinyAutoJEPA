@@ -12,11 +12,11 @@ from vicreg import vicreg_loss
 # --- CONFIG ---
 BATCH_SIZE = 256
 EPOCHS = 50
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 3e-4 # Standard VICReg rate
 DEVICE = "cuda"
 
-# --- AUGMENTATION (MOVED BACK TO GPU) ---
-# Now that we have ROCm 7.1, we can run this on the GPU safely.
+# --- AUGMENTATION (GPU - Eager Mode) ---
+# We will NOT compile this class. It runs fast enough in eager mode.
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
@@ -25,6 +25,7 @@ class GPUAugment(nn.Module):
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            # Normalization helps prevent NaNs by keeping inputs centered
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
@@ -37,6 +38,7 @@ class CarRacingDataset(Dataset):
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
+        # Load all chunks
         for f in tqdm(files, desc="Loading Chunks"):
             try:
                 data = np.load(f)
@@ -65,8 +67,6 @@ class VICRegModel(nn.Module):
         super().__init__()
         # Encoder
         resnet = models.resnet18(weights=None)
-        # We replace the first layer to accept 64x64 images better if needed,
-        # but standard ResNet is fine.
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
         
@@ -91,18 +91,18 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # Fast loading (CPU just passes bytes, doesn't process)
+    # 8 Workers for fast data loading
     dataset = CarRacingDataset("data")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     
     model = VICRegModel().to(DEVICE)
-    augmentor = GPUAugment().to(DEVICE) # Augmentation lives on GPU now
+    augmentor = GPUAugment().to(DEVICE)
     
-    # Enable Compiler for RDNA 4 (Optional: Comment out if it errors, but 7.1 should handle it)
+    # FIX: Compile ONLY the model, NOT the augmentor
+    # The augmentor was causing the "Graph Breaks" and slowing things down.
     try:
-        print("Compiling model for RDNA 4...")
+        print("Compiling ResNet Model (Standard Mode)...")
         model = torch.compile(model)
-        augmentor = torch.compile(augmentor)
     except Exception as e:
         print(f"Compilation skipped: {e}")
 
@@ -116,29 +116,40 @@ def train():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for batch_imgs in pbar:
-            # 1. Move raw data to GPU (Fast)
+            # 1. Move to GPU
             batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
             
-            # 2. Convert to Float on GPU (Massive Parallelism)
+            # 2. Convert to Float
             batch_imgs = batch_imgs.float() / 255.0
             
-            # 3. Augment on GPU
-            # We treat the same batch twice to get two views
+            # 3. Augment (Eager Mode - No Compiler Issues)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 view_1 = augmentor(batch_imgs)
                 view_2 = augmentor(batch_imgs)
                 
-                # 4. Forward & Loss
+                # 4. Forward Pass
                 _, z1 = model(view_1)
                 _, z2 = model(view_2)
-                loss = vicreg_loss(z1, z2)
+                
+                # FIX: Force Loss Calculation to Float32 to prevent NaN
+                loss = vicreg_loss(z1.float(), z2.float())
             
+            # 5. Backward Pass
             scaler.scale(loss).backward()
+            
+            # FIX: Gradient Clipping (Prevents Exploding Gradients)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
-            
             optimizer.zero_grad()
             
+            # Check for NaN again just in case
+            if torch.isnan(loss):
+                print("PANIC: Loss is NaN! Reducing LR or checking data...")
+                break
+                
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
