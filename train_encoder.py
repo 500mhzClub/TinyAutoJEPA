@@ -57,7 +57,8 @@ class CarRacingDataset(Dataset):
 
 # --- AUGMENTATION PIPELINE ---
 augment_transform = transforms.Compose([
-    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
+    # FIX: antialias=False prevents the HIP kernel crash on RDNA cards
+    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=False),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
     transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
@@ -99,11 +100,13 @@ def train():
     
     # Setup Model
     model = VICRegModel().to(DEVICE)
-    try:
-        model = torch.compile(model)
-        print("PyTorch 2.0 Compiler Active.")
-    except Exception as e:
-        print(f"Compiler skipped: {e}")
+    
+    # FIX: Disabled torch.compile for stability on consumer cards
+    # try:
+    #     model = torch.compile(model)
+    #     print("PyTorch 2.0 Compiler Active.")
+    # except Exception as e:
+    #     print(f"Compiler skipped: {e}")
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
     scaler = torch.amp.GradScaler("cuda") 
