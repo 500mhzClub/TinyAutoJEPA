@@ -7,8 +7,8 @@ import time
 
 # --- CONFIGURATION ---
 # 5950X Sweet Spot: 20-24 threads. 32 might choke on Box2D math.
-NUM_WORKERS = 1        
-EPISODES_PER_WORKER = 1  # Total = 24 * 80 = 1920 episodes
+NUM_WORKERS = 24        
+EPISODES_PER_WORKER = 80  # Total = 24 * 80 = 1920 episodes
 MAX_STEPS = 600
 DATA_DIR = "data"
 IMG_SIZE = 64
@@ -44,7 +44,7 @@ def get_correlated_action(env, previous_steering):
 def worker_func(worker_id):
     seed = int(time.time()) + worker_id * 1000
     # try:
-    env = gym.make("CarRacing-v2", render_mode=None)
+    env = gym.make("CarRacing-v3", render_mode=None)
     # except:
     #     return
 
