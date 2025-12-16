@@ -54,9 +54,9 @@ def worker_func(worker_id):
         obs, _ = env.reset(seed=seed + episode)
         obs = process_frame(obs)
         
-        # Zoom-in wait
+# Skip the first 50 frames (zooming in animation)
         for _ in range(50):
-            obs, _, _, _, _ = env.step([0, 0, 0])
+            obs, _, _, _, _ = env.step(np.array([0, 0, 0], dtype=np.float32))
             obs = process_frame(obs)
 
         current_steering = 0.0
