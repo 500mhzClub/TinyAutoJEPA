@@ -13,18 +13,23 @@ from vicreg import vicreg_loss
 BATCH_SIZE = 256
 EPOCHS = 50
 LEARNING_RATE = 3e-4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda"
 
-# --- AUGMENTATION (MOVED TO CPU) ---
-# We define this globally so the CPU workers can access it.
-# The CPU handles the resizing (bypassing the GPU driver bug) 
-# and hands a finished tensor to the GPU.
-augment_transform = transforms.Compose([
-    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True), 
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-])
+# --- AUGMENTATION (MOVED BACK TO GPU) ---
+# Now that we have ROCm 7.1, we can run this on the GPU safely.
+class GPUAugment(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transform = transforms.Compose([
+            transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def forward(self, x):
+        return self.transform(x)
 
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
@@ -32,7 +37,6 @@ class CarRacingDataset(Dataset):
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
-        # Load only 'states' to save memory
         for f in tqdm(files, desc="Loading Chunks"):
             try:
                 data = np.load(f)
@@ -53,25 +57,16 @@ class CarRacingDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # 1. Get image as uint8 numpy array
-        img = self.images[idx]
-        
-        # 2. Convert to Tensor on CPU
-        # This creates a Float tensor (0.0 to 1.0)
-        img_tensor = torch.from_numpy(img).float() / 255.0
-        
-        # 3. Augment on CPU (The Fix!)
-        # The CPU workers handle this in parallel.
-        v1 = augment_transform(img_tensor)
-        v2 = augment_transform(img_tensor)
-        
-        return v1, v2
+        # Return raw uint8 to speed up transfer to GPU
+        return torch.from_numpy(self.images[idx])
 
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
         # Encoder
         resnet = models.resnet18(weights=None)
+        # We replace the first layer to accept 64x64 images better if needed,
+        # but standard ResNet is fine.
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
         
@@ -96,14 +91,23 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # We increase num_workers to 8 so the Ryzen 3600X can crush the image resizing 
-    # faster than the GPU can train.
+    # Fast loading (CPU just passes bytes, doesn't process)
     dataset = CarRacingDataset("data")
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     
     model = VICRegModel().to(DEVICE)
+    augmentor = GPUAugment().to(DEVICE) # Augmentation lives on GPU now
+    
+    # Enable Compiler for RDNA 4 (Optional: Comment out if it errors, but 7.1 should handle it)
+    try:
+        print("Compiling model for RDNA 4...")
+        model = torch.compile(model)
+        augmentor = torch.compile(augmentor)
+    except Exception as e:
+        print(f"Compilation skipped: {e}")
+
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
-    scaler = torch.amp.GradScaler("cuda") 
+    scaler = torch.amp.GradScaler("cuda")
 
     print(f"Starting training on {DEVICE}...")
     
@@ -111,23 +115,29 @@ def train():
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        # The dataloader now yields TWO pre-augmented views
-        for v1, v2 in pbar:
-            # Move to GPU only AFTER augmentation is done
-            v1 = v1.to(DEVICE, non_blocking=True)
-            v2 = v2.to(DEVICE, non_blocking=True)
+        for batch_imgs in pbar:
+            # 1. Move raw data to GPU (Fast)
+            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
             
-            optimizer.zero_grad()
+            # 2. Convert to Float on GPU (Massive Parallelism)
+            batch_imgs = batch_imgs.float() / 255.0
             
-            # The GPU now ONLY does Matrix Math (BF16), which it excels at.
+            # 3. Augment on GPU
+            # We treat the same batch twice to get two views
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                _, z1 = model(v1)
-                _, z2 = model(v2)
+                view_1 = augmentor(batch_imgs)
+                view_2 = augmentor(batch_imgs)
+                
+                # 4. Forward & Loss
+                _, z1 = model(view_1)
+                _, z2 = model(view_2)
                 loss = vicreg_loss(z1, z2)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
+            optimizer.zero_grad()
             
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
