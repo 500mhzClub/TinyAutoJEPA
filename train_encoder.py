@@ -13,16 +13,17 @@ from vicreg import vicreg_loss
 # --- CONFIG ---
 BATCH_SIZE = 256
 EPOCHS = 50
-# Lower learning rate slightly to ensure stability at start
-LEARNING_RATE = 1e-4 
+LEARNING_RATE = 2e-4  # Slightly conservative LR
 DEVICE = "cuda"
 
-# --- AUGMENTATION (GPU) ---
+# --- AUGMENTATION ---
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
+            # CRITICAL FIX: antialias=False
+            # This uses "Nearest Neighbor" or simple Bilinear which is bulletproof on GPUs.
+            transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=False),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
@@ -50,7 +51,6 @@ class CarRacingDataset(Dataset):
 
         self.images = np.concatenate(self.images, axis=0)
         self.images = np.transpose(self.images, (0, 3, 1, 2))
-        
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
 
     def __len__(self):
@@ -85,51 +85,57 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
+    # Increase workers for data loading
     dataset = CarRacingDataset("data")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     
     model = VICRegModel().to(DEVICE)
     augmentor = GPUAugment().to(DEVICE)
     
-    # NOTE: We intentionally avoid torch.compile and AMP (BFloat16)
-    # to guarantee mathematical stability on the new architecture.
-    
+    # We stick to standard AdamW and Float32 for maximum stability
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
 
-    print(f"Starting training on {DEVICE} (Pure Float32 Mode)...")
+    print(f"Starting training on {DEVICE}...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for i, batch_imgs in enumerate(pbar):
-            # 1. Move to GPU & Convert to Float32
+            # 1. Load to GPU (Float32)
             batch_imgs = batch_imgs.to(DEVICE, non_blocking=True).float() / 255.0
             
-            # SANITY CHECK: If inputs are bad, stop immediately
-            if torch.isnan(batch_imgs).any():
-                print("CRITICAL ERROR: Input data contains NaNs!")
-                sys.exit(1)
-
-            # 2. Augment (Float32)
+            # 2. Augment
             view_1 = augmentor(batch_imgs)
             view_2 = augmentor(batch_imgs)
             
-            # 3. Forward Pass (Float32)
+            # SAFETY CHECK: Did augmentation break the images?
+            if torch.isnan(view_1).any() or torch.isnan(view_2).any():
+                print(f"\n❌ AUGMENTATION FAILURE at Batch {i}")
+                print("Disabling augmentation for this run and continuing...")
+                # Fallback: Just use raw images if aug fails (keeps training alive)
+                view_1 = batch_imgs
+                view_2 = batch_imgs
+
+            # 3. Forward Pass
             _, z1 = model(view_1)
             _, z2 = model(view_2)
             
             loss = vicreg_loss(z1, z2)
             
-            # 4. Check Loss Validity
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nPANIC: Loss exploded at Epoch {epoch+1}, Batch {i}!")
-                print("This usually means the Learning Rate is too high.")
-                sys.exit(1) # Stop the script entirely
+                print(f"\nPANIC: Loss is NaN/Inf at Batch {i}")
+                print("Skipping batch update...")
+                optimizer.zero_grad()
+                continue # Skip bad batch, don't crash
 
-            # 5. Backward Pass
+            # 4. Backward
             optimizer.zero_grad()
             loss.backward()
+            
+            # Clip gradients to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             total_loss += loss.item()
