@@ -1,0 +1,24 @@
+# --- Core Environment & Physics ---
+# The simulation environment. [box2d] includes the physics engine.
+gymnasium[box2d]>=0.29.1
+
+# Required to build Box2D (often fixes installation errors on Windows/Linux)
+swig
+
+# --- Data Processing ---
+# Essential for handling the large arrays of image data
+numpy>=1.24.0
+
+# Used for resizing images (96x96 -> 64x64) and converting colors
+opencv-python
+
+# --- Training Utilities ---
+# Progress bars for your long training loops (essential for sanity)
+tqdm
+
+# --- Visualization & Demo ---
+# For plotting the Energy graphs and saving the demo images
+matplotlib
+
+# Used for PCA (Principal Component Analysis) to visualize embeddings
+scikit-learn
