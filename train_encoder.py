@@ -13,25 +13,20 @@ from vicreg import vicreg_loss
 # --- CONFIG ---
 BATCH_SIZE = 256
 EPOCHS = 50
-LEARNING_RATE = 2e-4  # Slightly conservative LR
+LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- AUGMENTATION ---
-class GPUAugment(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.transform = transforms.Compose([
-            # CRITICAL FIX: antialias=False
-            # This uses "Nearest Neighbor" or simple Bilinear which is bulletproof on GPUs.
-            transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=False),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
-    def forward(self, x):
-        return self.transform(x)
+# --- CPU AUGMENTATION PIPELINE ---
+# We run this on the CPU to bypass the GPU driver bug.
+# CPU operations in PyTorch are extremely stable.
+cpu_transform = transforms.Compose([
+    transforms.ToPILImage(), # Convert tensor/numpy to PIL for standard transforms
+    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True), # Safe on CPU!
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
+    transforms.ToTensor(), # Convert back to Tensor (0.0 to 1.0)
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
@@ -50,14 +45,22 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        self.images = np.transpose(self.images, (0, 3, 1, 2))
+        # We keep data as Channel Last (H, W, C) for PIL compatibility
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        return torch.from_numpy(self.images[idx])
+        # 1. Get Raw Image (uint8)
+        img = self.images[idx]
+        
+        # 2. Augment TWICE on CPU
+        # This runs in a background process, so it doesn't block the GPU
+        view_1 = cpu_transform(img)
+        view_2 = cpu_transform(img)
+        
+        return view_1, view_2
 
 class VICRegModel(nn.Module):
     def __init__(self):
@@ -85,57 +88,42 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # Increase workers for data loading
     dataset = CarRacingDataset("data")
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    
+    # CRITICAL: num_workers=12 uses your Ryzen 3600X fully.
+    # pin_memory=True speeds up the CPU -> GPU transfer.
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=12, 
+        pin_memory=True, 
+        persistent_workers=True
+    )
     
     model = VICRegModel().to(DEVICE)
-    augmentor = GPUAugment().to(DEVICE)
-    
-    # We stick to standard AdamW and Float32 for maximum stability
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
 
-    print(f"Starting training on {DEVICE}...")
+    print(f"Starting training on {DEVICE} (CPU Augmentation Pipeline)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for i, batch_imgs in enumerate(pbar):
-            # 1. Load to GPU (Float32)
-            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True).float() / 255.0
+        for view_1, view_2 in pbar:
+            # 1. Move Clean Tensors to GPU
+            view_1 = view_1.to(DEVICE, non_blocking=True)
+            view_2 = view_2.to(DEVICE, non_blocking=True)
             
-            # 2. Augment
-            view_1 = augmentor(batch_imgs)
-            view_2 = augmentor(batch_imgs)
-            
-            # SAFETY CHECK: Did augmentation break the images?
-            if torch.isnan(view_1).any() or torch.isnan(view_2).any():
-                print(f"\n❌ AUGMENTATION FAILURE at Batch {i}")
-                print("Disabling augmentation for this run and continuing...")
-                # Fallback: Just use raw images if aug fails (keeps training alive)
-                view_1 = batch_imgs
-                view_2 = batch_imgs
-
-            # 3. Forward Pass
+            # 2. Forward Pass
             _, z1 = model(view_1)
             _, z2 = model(view_2)
             
             loss = vicreg_loss(z1, z2)
             
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nPANIC: Loss is NaN/Inf at Batch {i}")
-                print("Skipping batch update...")
-                optimizer.zero_grad()
-                continue # Skip bad batch, don't crash
-
-            # 4. Backward
+            # 3. Backward
             optimizer.zero_grad()
             loss.backward()
-            
-            # Clip gradients to prevent explosion
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             
             total_loss += loss.item()
