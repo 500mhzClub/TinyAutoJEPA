@@ -15,14 +15,24 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# --- AUGMENTATION (MOVED TO CPU) ---
+# We define this globally so the CPU workers can access it.
+# The CPU handles the resizing (bypassing the GPU driver bug) 
+# and hands a finished tensor to the GPU.
+augment_transform = transforms.Compose([
+    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True), 
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
+    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+])
+
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
         print(f"Loading data from {data_dir}...")
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
-        # 1. OPTIMIZATION: Only load 'states' to avoid duplicates
-        # 'next_states' is just 'states' shifted by one, so we don't need it for the Encoder.
+        # Load only 'states' to save memory
         for f in tqdm(files, desc="Loading Chunks"):
             try:
                 data = np.load(f)
@@ -31,48 +41,41 @@ class CarRacingDataset(Dataset):
                 print(f"Skipping corrupt file {f}: {e}")
                 
         if not self.images:
-            raise RuntimeError("No data found! Did you copy the 'data' folder?")
+            raise RuntimeError("No data found!")
 
-        # 2. OPTIMIZATION: Keep as uint8 in RAM! (1 byte per pixel vs 8 bytes)
         self.images = np.concatenate(self.images, axis=0)
-        
-        # Current Shape: (N, 64, 64, 3) -> We want (N, 3, 64, 64)
-        # Transpose is fast on uint8
+        # Transpose to (N, 3, 64, 64)
         self.images = np.transpose(self.images, (0, 3, 1, 2))
         
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
-        print(f"Total Images: {len(self.images)}")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # 3. ON-THE-FLY CONVERSION:
-        # Only convert a single image to float when requested.
-        # This keeps the massive array in RAM small.
+        # 1. Get image as uint8 numpy array
         img = self.images[idx]
         
-        # Convert numpy uint8 -> torch float32 and Normalize (0-1)
-        return torch.from_numpy(img).float() / 255.0
-
-# --- AUGMENTATION PIPELINE ---
-augment_transform = transforms.Compose([
-    # FIX: antialias=False prevents the HIP kernel crash on RDNA cards
-    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=False),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-])
+        # 2. Convert to Tensor on CPU
+        # This creates a Float tensor (0.0 to 1.0)
+        img_tensor = torch.from_numpy(img).float() / 255.0
+        
+        # 3. Augment on CPU (The Fix!)
+        # The CPU workers handle this in parallel.
+        v1 = augment_transform(img_tensor)
+        v2 = augment_transform(img_tensor)
+        
+        return v1, v2
 
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Encoder: ResNet18 (No fc layer)
+        # Encoder
         resnet = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
         
-        # Projector: 3-layer MLP
+        # Projector
         self.projector = nn.Sequential(
             nn.Linear(self.feature_dim, 2048),
             nn.BatchNorm1d(2048),
@@ -84,30 +87,21 @@ class VICRegModel(nn.Module):
         )
 
     def forward(self, x):
-        h = self.encoder(x)          # [Batch, 512, 1, 1]
-        h = h.view(h.size(0), -1)    # [Batch, 512]
-        z = self.projector(h)        # [Batch, 2048]
+        h = self.encoder(x)          
+        h = h.view(h.size(0), -1)    
+        z = self.projector(h)        
         return h, z
 
 # --- TRAINING LOOP ---
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # Setup Data
-    # pin_memory=True speeds up transfer from RAM to GPU
+    # We increase num_workers to 8 so the Ryzen 3600X can crush the image resizing 
+    # faster than the GPU can train.
     dataset = CarRacingDataset("data")
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
     
-    # Setup Model
     model = VICRegModel().to(DEVICE)
-    
-    # FIX: Disabled torch.compile for stability on consumer cards
-    # try:
-    #     model = torch.compile(model)
-    #     print("PyTorch 2.0 Compiler Active.")
-    # except Exception as e:
-    #     print(f"Compiler skipped: {e}")
-
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
     scaler = torch.amp.GradScaler("cuda") 
 
@@ -117,19 +111,18 @@ def train():
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for batch_imgs in pbar:
-            batch_imgs = batch_imgs.to(DEVICE)
-            
-            # Create two augmented views
-            view_1 = augment_transform(batch_imgs)
-            view_2 = augment_transform(batch_imgs)
+        # The dataloader now yields TWO pre-augmented views
+        for v1, v2 in pbar:
+            # Move to GPU only AFTER augmentation is done
+            v1 = v1.to(DEVICE, non_blocking=True)
+            v2 = v2.to(DEVICE, non_blocking=True)
             
             optimizer.zero_grad()
             
-            # AutoCast to BFloat16 (Native on RDNA 4)
+            # The GPU now ONLY does Matrix Math (BF16), which it excels at.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                _, z1 = model(view_1)
-                _, z2 = model(view_2)
+                _, z1 = model(v1)
+                _, z2 = model(v2)
                 loss = vicreg_loss(z1, z2)
             
             scaler.scale(loss).backward()
@@ -146,7 +139,7 @@ def train():
             torch.save(model.state_dict(), f"models/encoder_epoch_{epoch+1}.pth")
 
     torch.save(model.state_dict(), "models/vicreg_encoder_final.pth")
-    print("Training Complete. Model saved.")
+    print("Training Complete.")
 
 if __name__ == "__main__":
     train()
