@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
-from torchvision.transforms import v2  # GPU-accelerated transforms
+from torchvision.transforms import v2 
 import numpy as np
 import glob
 import os
@@ -12,38 +12,39 @@ import psutil
 from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 512  # Increased: GPU augs allow larger batches
+BATCH_SIZE = 512
 EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
 # --- LOSS ---
-def variance_loss(x, gamma=1.0):
-    std = torch.sqrt(x.var(dim=0) + 1e-04)
-    loss = torch.mean(F.relu(gamma - std))
-    return loss
-
-def covariance_loss(x):
-    batch_size, dim = x.shape
-    x = x - x.mean(dim=0)
-    cov = (x.T @ x) / (batch_size - 1)
-    off_diag = cov.flatten()[:-1].view(dim - 1, dim + 1)[:, 1:].flatten()
-    loss = off_diag.pow(2).sum() / dim
-    return loss
-
 def vicreg_loss(x, y):
+    # Invariance
     sim_loss = F.mse_loss(x, y)
-    std_loss = variance_loss(x) + variance_loss(y)
-    cov_loss = covariance_loss(x) + covariance_loss(y)
+    
+    # Variance
+    std_x = torch.sqrt(x.var(dim=0) + 1e-04)
+    std_y = torch.sqrt(y.var(dim=0) + 1e-04)
+    std_loss = torch.mean(F.relu(1.0 - std_x)) + torch.mean(F.relu(1.0 - std_y))
+    
+    # Covariance
+    x = x - x.mean(dim=0)
+    y = y - y.mean(dim=0)
+    cov_x = (x.T @ x) / (BATCH_SIZE - 1)
+    cov_y = (y.T @ y) / (BATCH_SIZE - 1)
+    
+    # Zero out diagonal
+    cov_loss = (cov_x.flatten()[:-1].view(511, 513)[:, 1:].flatten().pow(2).sum() / 512) + \
+               (cov_y.flatten()[:-1].view(511, 513)[:, 1:].flatten().pow(2).sum() / 512)
+
     return (25.0 * sim_loss) + (25.0 * std_loss) + (1.0 * cov_loss)
 
-# --- GPU AUGMENTATION MODULE ---
+# --- GPU AUGMENTATION ---
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
         self.transforms = nn.Sequential(
-            # Input is (B, 3, 64, 64) uint8 on GPU
-            v2.ToDtype(torch.float32, scale=True), # 0-255 -> 0.0-1.0
+            v2.ToDtype(torch.float32, scale=True),
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ColorJitter(brightness=0.2, contrast=0.2),
@@ -54,112 +55,88 @@ class GPUAugment(nn.Module):
     def forward(self, x):
         return self.transforms(x)
 
-# --- DATASET (Now Dumb & Fast) ---
+# --- DATASET ---
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
-        print(f"Loading data from {data_dir}...")
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
-        # Check RAM
-        mem = psutil.virtual_memory()
-        print(f"System RAM Available: {mem.available / 1e9:.2f} GB")
-        
-        for f in tqdm(files, desc="Loading Chunks"):
+        # Load all data into RAM
+        for f in tqdm(files, desc="Loading Data"):
             try:
-                data = np.load(f)
-                self.images.append(data['states']) 
-            except Exception as e:
-                print(f"Skipping {f}: {e}")
+                self.images.append(np.load(f)['states']) 
+            except: pass
                 
-        if not self.images:
-            raise RuntimeError("No data found!")
-
         self.images = np.concatenate(self.images, axis=0)
-        print(f"Dataset Loaded. {len(self.images)} images. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
+        # Keep as uint8 (N, 64, 64, 3) to save RAM/Bandwidth
+        print(f"RAM Data: {self.images.nbytes / 1e9:.2f} GB | Shape: {self.images.shape}")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # FAST PATH: No processing here. Just strict copy.
-        img = self.images[idx] # (64, 64, 3)
-        # Permute needed because PyTorch wants (C, H, W)
-        # We return ByteTensor (uint8) to save bandwidth moving to GPU
-        return torch.from_numpy(img).permute(2, 0, 1)
+        # Direct memory slice (super fast in main thread)
+        return torch.from_numpy(self.images[idx]).permute(2, 0, 1)
 
+# --- MODEL ---
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
         resnet = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
-        self.feature_dim = 512
         
         self.projector = nn.Sequential(
-            nn.Linear(self.feature_dim, 2048),
-            nn.BatchNorm1d(2048),
-            nn.ReLU(),
-            nn.Linear(2048, 2048),
-            nn.BatchNorm1d(2048),
-            nn.ReLU(),
+            nn.Linear(512, 2048), nn.BatchNorm1d(2048), nn.ReLU(),
+            nn.Linear(2048, 2048), nn.BatchNorm1d(2048), nn.ReLU(),
             nn.Linear(2048, 2048)
         )
 
     def forward(self, x):
-        h = self.encoder(x)          
-        h = h.view(h.size(0), -1)    
-        z = self.projector(h)        
+        h = self.encoder(x).view(x.size(0), -1)
+        z = self.projector(h)
         return h, z
 
 def train():
     os.makedirs("models", exist_ok=True)
-    
     dataset = CarRacingDataset("data")
     
-    # 4 Workers is plenty when they do zero processing
+    # --- CRITICAL FIX: Workers=0 ---
+    # Since data is in RAM, we avoid the overhead of forking 
+    # the 12GB memory space. Main thread feeds GPU directly.
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=4, 
-        pin_memory=True, 
-        persistent_workers=True,
+        num_workers=0,  # <-- ZERO WORKERS
+        pin_memory=True,
         drop_last=True
     )
     
     model = VICRegModel().to(DEVICE)
-    augmentor = GPUAugment().to(DEVICE) # Augmentation lives on GPU now
+    augmentor = GPUAugment().to(DEVICE)
     
-    # Compile both for max speed on RDNA 4
-    # (Note: sometimes v2 transforms don't like compile, if it crashes, remove compile on augmentor)
-    print("Compiling model...")
-    model = torch.compile(model)
-    # augmentor = torch.compile(augmentor) # Optional: Uncomment if stable
-    
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
+    # Disabled torch.compile to rule out JIT issues
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scaler = torch.amp.GradScaler('cuda')
 
-    print(f"Starting training on {DEVICE} (GPU Augmentation Mode)...")
+    print(f"Starting training on {DEVICE} (Workers=0, GPU Augs)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for batch in pbar:
-            # 1. Move Raw Uint8 Batch to GPU (Very fast)
+            # 1. Fetch & Augment
             batch = batch.to(DEVICE, non_blocking=True)
-            
-            # 2. Augment on GPU (Parallel & Fast)
             with torch.no_grad():
-                view_1 = augmentor(batch)
-                view_2 = augmentor(batch)
+                v1 = augmentor(batch)
+                v2 = augmentor(batch)
             
+            # 2. Train
             optimizer.zero_grad(set_to_none=True)
-            
-            # 3. Forward & Loss (BFloat16)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                _, z1 = model(view_1)
-                _, z2 = model(view_2)
+                _, z1 = model(v1)
+                _, z2 = model(v2)
                 loss = vicreg_loss(z1, z2)
             
             scaler.scale(loss).backward()
@@ -169,14 +146,11 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-        
+        print(f"Epoch {epoch+1} Avg Loss: {total_loss / len(dataloader):.4f}")
         if (epoch+1) % 10 == 0:
             torch.save(model.state_dict(), f"models/encoder_epoch_{epoch+1}.pth")
 
     torch.save(model.state_dict(), "models/vicreg_encoder_final.pth")
-    print("Training Complete.")
 
 if __name__ == "__main__":
     train()
