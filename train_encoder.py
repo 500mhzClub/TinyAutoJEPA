@@ -19,6 +19,11 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+# --- CRITICAL FIX: CACHE KERNELS ---
+# This forces PyTorch to find the best algorithm ONCE and re-use it.
+# Essential for RDNA cards when kernel databases are missing.
+torch.backends.cudnn.benchmark = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
