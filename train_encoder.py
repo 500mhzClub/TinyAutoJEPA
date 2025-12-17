@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import models
 import numpy as np
 import glob
 import os
 import sys
 from tqdm import tqdm
 from vicreg import vicreg_loss
+import kornia.augmentation as K
 
 # --- CONFIG ---
 BATCH_SIZE = 256
@@ -16,17 +17,26 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- CPU AUGMENTATION PIPELINE ---
-# We run this on the CPU to bypass the GPU driver bug.
-# CPU operations in PyTorch are extremely stable.
-cpu_transform = transforms.Compose([
-    transforms.ToPILImage(), # Convert tensor/numpy to PIL for standard transforms
-    transforms.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True), # Safe on CPU!
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
-    transforms.ToTensor(), # Convert back to Tensor (0.0 to 1.0)
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# --- KORNIA GPU PIPELINE ---
+# Kornia implements transforms using differentiable matrix math (grid_sample),
+# which bypasses the specific "upsample" driver bug on RDNA 4.
+class KorniaAugment(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # We wrap it in a Sequential container
+        # same_on_batch=False ensures every image gets a DIFFERENT random crop
+        self.aug = K.AugmentationSequential(
+            K.RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0), antialias=True),
+            K.RandomHorizontalFlip(p=0.5),
+            K.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
+            K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+            K.Normalize(mean=torch.tensor([0.485, 0.456, 0.406]), 
+                        std=torch.tensor([0.229, 0.224, 0.225])),
+            data_keys=["input"]
+        )
+
+    def forward(self, x):
+        return self.aug(x)
 
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
@@ -45,22 +55,17 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        # We keep data as Channel Last (H, W, C) for PIL compatibility
+        # Kornia expects (B, C, H, W) in float 0-1
+        self.images = np.transpose(self.images, (0, 3, 1, 2))
+        
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # 1. Get Raw Image (uint8)
-        img = self.images[idx]
-        
-        # 2. Augment TWICE on CPU
-        # This runs in a background process, so it doesn't block the GPU
-        view_1 = cpu_transform(img)
-        view_2 = cpu_transform(img)
-        
-        return view_1, view_2
+        # Return raw uint8 tensor
+        return torch.from_numpy(self.images[idx])
 
 class VICRegModel(nn.Module):
     def __init__(self):
@@ -90,38 +95,45 @@ def train():
     
     dataset = CarRacingDataset("data")
     
-    # CRITICAL: num_workers=12 uses your Ryzen 3600X fully.
-    # pin_memory=True speeds up the CPU -> GPU transfer.
+    # We reduce workers because the CPU does almost nothing now.
+    # It just hands memory to the GPU.
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=12, 
+        num_workers=4, 
         pin_memory=True, 
         persistent_workers=True
     )
     
     model = VICRegModel().to(DEVICE)
+    augmentor = KorniaAugment().to(DEVICE) # The Magic Fix
+    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
 
-    print(f"Starting training on {DEVICE} (CPU Augmentation Pipeline)...")
+    print(f"Starting training on {DEVICE} (Kornia GPU Pipeline)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for view_1, view_2 in pbar:
-            # 1. Move Clean Tensors to GPU
-            view_1 = view_1.to(DEVICE, non_blocking=True)
-            view_2 = view_2.to(DEVICE, non_blocking=True)
+        for batch_imgs in pbar:
+            # 1. Move Raw Uint8 to GPU (Fast Transfer)
+            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
             
-            # 2. Forward Pass
+            # 2. Convert to Float (0-1) on GPU
+            batch_imgs = batch_imgs.float() / 255.0
+            
+            # 3. Kornia Augmentation (Runs via matrix math, bypassing broken kernels)
+            view_1 = augmentor(batch_imgs)
+            view_2 = augmentor(batch_imgs)
+            
+            # 4. Forward & Backward
             _, z1 = model(view_1)
             _, z2 = model(view_2)
             
             loss = vicreg_loss(z1, z2)
             
-            # 3. Backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

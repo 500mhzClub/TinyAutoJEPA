@@ -22,3 +22,5 @@ matplotlib
 
 # Used for PCA (Principal Component Analysis) to visualize embeddings
 scikit-learn
+
+kornia
