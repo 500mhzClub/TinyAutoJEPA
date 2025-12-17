@@ -17,48 +17,33 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- FIXED VICREG LOSS ---
+# --- LOSS ---
 def off_diagonal(x):
-    # Dynamic shape handling (Works for 512, 2048, or any dim)
     n, m = x.shape
     assert n == m
-    # Flatten and remove the last element
     x = x.flatten()[:-1]
-    # Reshape to (n-1, n+1) to shift diagonals
     x = x.view(n - 1, n + 1)
-    # Remove the first column (which contains the diagonals)
     x = x[:, 1:].flatten()
     return x
 
 def vicreg_loss(x, y):
-    # x, y are (Batch_Size, 2048)
-    
-    # 1. Invariance Loss (MSE)
+    # Invariance
     sim_loss = F.mse_loss(x, y)
     
-    # 2. Variance Loss (Hinge)
-    # Calculate std across batch
+    # Variance
     std_x = torch.sqrt(x.var(dim=0) + 1e-04)
     std_y = torch.sqrt(y.var(dim=0) + 1e-04)
-    # Target std is 1.0. Penalize if < 1.0
     std_loss = torch.mean(F.relu(1.0 - std_x)) + torch.mean(F.relu(1.0 - std_y))
     
-    # 3. Covariance Loss
-    batch_size, num_features = x.shape
-    
-    # Center the vectors
+    # Covariance
     x = x - x.mean(dim=0)
     y = y - y.mean(dim=0)
+    cov_x = (x.T @ x) / (BATCH_SIZE - 1)
+    cov_y = (y.T @ y) / (BATCH_SIZE - 1)
     
-    # Calculate Covariance Matrix (2048x2048)
-    cov_x = (x.T @ x) / (batch_size - 1)
-    cov_y = (y.T @ y) / (batch_size - 1)
+    cov_loss = off_diagonal(cov_x).pow(2).sum() / x.shape[1] + \
+               off_diagonal(cov_y).pow(2).sum() / y.shape[1]
     
-    # Penalize off-diagonal elements
-    cov_loss = off_diagonal(cov_x).pow(2).sum() / num_features + \
-               off_diagonal(cov_y).pow(2).sum() / num_features
-    
-    # Weights: 25.0 for Sim/Var, 1.0 for Cov
     return (25.0 * sim_loss) + (25.0 * std_loss) + (1.0 * cov_loss)
 
 # --- GPU AUGMENTATION ---
@@ -66,6 +51,9 @@ class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
         self.transforms = nn.Sequential(
+            # 1. Permute on GPU (Fastest)
+            v2.PermuteDimensions(dims=(0, 3, 1, 2)), # (B, H, W, C) -> (B, C, H, W)
+            # 2. Convert to Float & Augment
             v2.ToDtype(torch.float32, scale=True),
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
@@ -77,38 +65,49 @@ class GPUAugment(nn.Module):
     def forward(self, x):
         return self.transforms(x)
 
-# --- DATASET ---
-class CarRacingDataset(Dataset):
-    def __init__(self, data_dir):
-        self.images = []
-        files = glob.glob(os.path.join(data_dir, "*.npz"))
-        
-        # Load all data into RAM
-        print(f"Loading {len(files)} files into RAM...")
-        for f in tqdm(files, desc="Loading Data"):
-            try:
-                self.images.append(np.load(f)['states']) 
-            except: pass
-                
-        self.images = np.concatenate(self.images, axis=0)
-        print(f"RAM Data: {self.images.nbytes / 1e9:.2f} GB | Shape: {self.images.shape}")
+# --- DATASET (SHARED MEMORY) ---
+class SharedMemoryDataset(Dataset):
+    def __init__(self, tensor_data):
+        self.data = tensor_data
 
     def __len__(self):
-        return len(self.images)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        # Direct memory slice
-        return torch.from_numpy(self.images[idx]).permute(2, 0, 1)
+        # Zero processing. Just return the bytes.
+        # Returns (64, 64, 3) ByteTensor
+        return self.data[idx]
+
+def load_data_to_shared_memory(data_dir):
+    print(f"Loading data from {data_dir}...")
+    files = glob.glob(os.path.join(data_dir, "*.npz"))
+    
+    # 1. Load Numpy
+    np_images = []
+    for f in tqdm(files, desc="Reading Disk"):
+        try:
+            np_images.append(np.load(f)['states']) 
+        except: pass
+    
+    np_images = np.concatenate(np_images, axis=0)
+    print(f"Numpy Loaded. Shape: {np_images.shape}")
+    
+    # 2. Convert to Shared Tensor
+    # We use uint8 (ByteTensor) to save 4x memory
+    print("Moving to Shared Memory Tensor...")
+    shared_tensor = torch.from_numpy(np_images)
+    shared_tensor.share_memory_() # <--- THE MAGIC SAUCE
+    
+    print(f"Shared Tensor Ready. RAM: {shared_tensor.nelement() / 1e9:.2f} GB")
+    return shared_tensor
 
 # --- MODEL ---
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
         resnet = models.resnet18(weights=None)
-        # ResNet18 output before FC is 512
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         
-        # Projector: 512 -> 2048 -> 2048 -> 2048
         self.projector = nn.Sequential(
             nn.Linear(512, 2048), nn.BatchNorm1d(2048), nn.ReLU(),
             nn.Linear(2048, 2048), nn.BatchNorm1d(2048), nn.ReLU(),
@@ -122,16 +121,20 @@ class VICRegModel(nn.Module):
 
 def train():
     os.makedirs("models", exist_ok=True)
-    dataset = CarRacingDataset("data")
     
-    # Workers=0 prevents memory thrashing
+    # Load data ONCE in main process
+    shared_data = load_data_to_shared_memory("data")
+    dataset = SharedMemoryDataset(shared_data)
+    
+    # 8 Workers reading from Shared Memory = Fast
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=0, 
-        pin_memory=True,
-        drop_last=True
+        num_workers=8,       # Safe now because of share_memory_()
+        pin_memory=False,    # Disabled to rule out ROCm pinning issues
+        drop_last=True,
+        persistent_workers=True
     )
     
     model = VICRegModel().to(DEVICE)
@@ -140,21 +143,23 @@ def train():
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scaler = torch.amp.GradScaler('cuda')
 
-    print(f"Starting training on {DEVICE} (Workers=0, GPU Augs)...")
+    print(f"Starting training on {DEVICE}...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for batch in pbar:
-            # 1. Fetch & Augment
+            # batch is (B, 64, 64, 3) ByteTensor
             batch = batch.to(DEVICE, non_blocking=True)
+            
+            # Augment (Includes Permute B,H,W,C -> B,C,H,W)
             with torch.no_grad():
                 v1 = augmentor(batch)
                 v2 = augmentor(batch)
             
-            # 2. Train
             optimizer.zero_grad(set_to_none=True)
+            
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 _, z1 = model(v1)
                 _, z2 = model(v2)
@@ -167,7 +172,9 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-        print(f"Epoch {epoch+1} Avg Loss: {total_loss / len(dataloader):.4f}")
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+        
         if (epoch+1) % 10 == 0:
             torch.save(model.state_dict(), f"models/encoder_epoch_{epoch+1}.pth")
 
