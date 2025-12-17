@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-tajeppa_required_diagnostics.py (autograd-profiler version)
+tajeppa_required_diagnostics.py (safe for ROCm + DataLoader)
 
 Produces:
-  (1) GPU batch shape (first batch-like CUDA tensor seen; fallback to largest)
+  (1) GPU batch line (first batch-like CUDA tensor; fallback largest)
   (2) profiler table sorted by self_cuda_time_total
 
-Stops after N optimizer steps by intercepting:
+Reliably stops after N optimizer steps by intercepting:
   - torch.amp.GradScaler.step
   - torch.cuda.amp.GradScaler.step
-  - optimizer.step on common optimizer classes
+  - optimizer.step for common optimizer subclasses
 
-This avoids torch.profiler/roctracer (which is causing segfaults in your log).
+IMPORTANT: To avoid DataLoader worker segfaults (fork after GPU init),
+this wrapper forces DataLoader(num_workers=0) by default.
+
+Override if you insist:
+  export TAJEPA_FORCE_NUM_WORKERS=4
 """
 
 from __future__ import annotations
@@ -112,6 +116,35 @@ def main() -> int:
 
     st = State(printed=False, steps=0, best=None, t0=time.time())
 
+    # --- Patch DataLoader to force num_workers=0 (prevents worker segfaults) ---
+    from torch.utils.data import DataLoader as _DataLoader  # noqa
+
+    orig_dl_init = _DataLoader.__init__
+
+    forced_workers = int(os.getenv("TAJEPA_FORCE_NUM_WORKERS", "0"))
+
+    def patched_dl_init(self, *a, **kw):
+        # DataLoader signature: (dataset, batch_size=1, shuffle=False, sampler=None,
+        # batch_sampler=None, num_workers=0, ...)
+        if "num_workers" in kw:
+            kw["num_workers"] = forced_workers
+        else:
+            # positional num_workers is index 5
+            if len(a) > 5:
+                a = list(a)
+                a[5] = forced_workers
+                a = tuple(a)
+            else:
+                kw["num_workers"] = forced_workers
+
+        # If forcing 0, also prevent persistent_workers edge cases
+        if forced_workers == 0 and "persistent_workers" in kw:
+            kw["persistent_workers"] = False
+
+        return orig_dl_init(self, *a, **kw)
+
+    _DataLoader.__init__ = patched_dl_init  # type: ignore[assignment]
+
     # --- Patch Tensor.to / .cuda to capture batch tensor ---
     orig_to = torch.Tensor.to
     orig_cuda = torch.Tensor.cuda
@@ -155,19 +188,19 @@ def main() -> int:
         if st.steps >= args.steps:
             raise StopAfterSteps(f"Stopped after {st.steps} optimizer steps.")
 
-    # Patch GradScaler.step (AMP)
     saved_amp_step = None
     saved_cuda_amp_step = None
 
     def patch_scaler(cls):
-        nonlocal saved_amp_step, saved_cuda_amp_step
         if cls is None or not hasattr(cls, "step"):
             return None
         orig = cls.step
+
         def wrapped(self, optimizer, *a, **kw):
             out = orig(self, optimizer, *a, **kw)
             tick()
             return out
+
         cls.step = wrapped  # type: ignore[assignment]
         return orig
 
@@ -176,9 +209,9 @@ def main() -> int:
     saved_amp_step = patch_scaler(amp_cls)
     saved_cuda_amp_step = patch_scaler(cuda_amp_cls)
 
-    # Patch common optimizer subclasses step() (non-AMP / fallback)
     import inspect
     import torch.optim as optim
+
     for _, cls in inspect.getmembers(optim, inspect.isclass):
         try:
             if not issubclass(cls, optim.Optimizer):
@@ -186,12 +219,15 @@ def main() -> int:
             if not hasattr(cls, "step"):
                 continue
             orig = cls.step
+
             def make_wrapped(orig_step):
                 def wrapped(self, *a, **kw):
                     out = orig_step(self, *a, **kw)
                     tick()
                     return out
+
                 return wrapped
+
             cls.step = make_wrapped(orig)  # type: ignore[assignment]
             orig_opt_steps[cls] = orig
         except Exception:
@@ -203,7 +239,7 @@ def main() -> int:
 
     try:
         with torch.autograd.profiler.profile(
-            use_cuda=True,
+            use_device="cuda",
             record_shapes=bool(args.record_shapes),
             profile_memory=bool(args.profile_memory),
         ) as prof:
@@ -222,6 +258,9 @@ def main() -> int:
         # Unpatch tensor
         torch.Tensor.to = orig_to  # type: ignore[assignment]
         torch.Tensor.cuda = orig_cuda  # type: ignore[assignment]
+
+        # Restore DataLoader
+        _DataLoader.__init__ = orig_dl_init  # type: ignore[assignment]
 
         # Restore scaler steps
         try:
