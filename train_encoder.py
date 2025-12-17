@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from torchvision.transforms import v2 
 import numpy as np
@@ -12,12 +11,12 @@ import psutil
 from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 512
+BATCH_SIZE = 512  # Large batch for GPU efficiency
 EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- LOSS (Dynamic Shape) ---
+# --- LOSS ---
 def off_diagonal(x):
     n, m = x.shape
     assert n == m
@@ -27,15 +26,12 @@ def off_diagonal(x):
     return x
 
 def vicreg_loss(x, y):
-    # Invariance
     sim_loss = F.mse_loss(x, y)
     
-    # Variance
     std_x = torch.sqrt(x.var(dim=0) + 1e-04)
     std_y = torch.sqrt(y.var(dim=0) + 1e-04)
     std_loss = torch.mean(F.relu(1.0 - std_x)) + torch.mean(F.relu(1.0 - std_y))
     
-    # Covariance
     x = x - x.mean(dim=0)
     y = y - y.mean(dim=0)
     cov_x = (x.T @ x) / (BATCH_SIZE - 1)
@@ -50,7 +46,6 @@ def vicreg_loss(x, y):
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
-        # Removed 'PermuteDimensions' to prevent AttributeError
         self.transforms = nn.Sequential(
             v2.ToDtype(torch.float32, scale=True),
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
@@ -61,23 +56,12 @@ class GPUAugment(nn.Module):
         )
 
     def forward(self, x):
-        # Manual Permute: (B, H, W, C) -> (B, C, H, W)
+        # (B, H, W, C) -> (B, C, H, W)
         x = x.permute(0, 3, 1, 2)
         return self.transforms(x)
 
-# --- DATASET (SHARED MEMORY) ---
-class SharedMemoryDataset(Dataset):
-    def __init__(self, tensor_data):
-        self.data = tensor_data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        # Zero processing. Just return the bytes.
-        return self.data[idx]
-
-def load_data_to_shared_memory(data_dir):
+# --- FAST DATA LOADING ---
+def load_all_data(data_dir):
     print(f"Loading data from {data_dir}...")
     files = glob.glob(os.path.join(data_dir, "*.npz"))
     
@@ -90,12 +74,13 @@ def load_data_to_shared_memory(data_dir):
     np_images = np.concatenate(np_images, axis=0)
     print(f"Numpy Loaded. Shape: {np_images.shape}")
     
-    print("Moving to Shared Memory Tensor...")
-    shared_tensor = torch.from_numpy(np_images)
-    shared_tensor.share_memory_() # Critical for Multiprocessing Speed
-    
-    print(f"Shared Tensor Ready. RAM: {shared_tensor.nelement() / 1e9:.2f} GB")
-    return shared_tensor
+    # Convert to PyTorch Tensor immediately
+    # We keep it on CPU (Pin Memory) for fast transfer
+    print("Converting to Pinned Tensor...")
+    data_tensor = torch.from_numpy(np_images)
+    # pinning memory speeds up CPU->GPU transfer
+    # but we do it manually on the big tensor
+    return data_tensor
 
 # --- MODEL ---
 class VICRegModel(nn.Module):
@@ -118,36 +103,45 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # Load data ONCE in main process
-    shared_data = load_data_to_shared_memory("data")
-    dataset = SharedMemoryDataset(shared_data)
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=8,       # High workers safe due to Shared Memory
-        pin_memory=False,    
-        drop_last=True,
-        persistent_workers=True
-    )
+    # 1. Load Data
+    all_data = load_all_data("data")
+    num_samples = len(all_data)
     
     model = VICRegModel().to(DEVICE)
     augmentor = GPUAugment().to(DEVICE)
     
+    # Optional: Compile if your PyTorch/ROCm version supports it well
+    # model = torch.compile(model) 
+    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scaler = torch.amp.GradScaler('cuda')
 
-    print(f"Starting training on {DEVICE}...")
+    print(f"Starting training on {DEVICE} (Vectorized Loading)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for batch in pbar:
+        # 2. Manual Shuffle Indices
+        indices = torch.randperm(num_samples)
+        
+        # 3. Manual Batch Loop (The key to speed)
+        # Instead of DataLoader, we slice chunks of the big tensor
+        num_batches = num_samples // BATCH_SIZE
+        
+        pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}")
+        
+        for i in pbar:
+            # A. Get indices for this batch
+            batch_idx = indices[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+            
+            # B. Slice directly (C-speed)
+            # This replaces 512 __getitem__ calls with 1 slice op
+            batch = all_data[batch_idx] 
+            
+            # C. Move to GPU
             batch = batch.to(DEVICE, non_blocking=True)
             
-            # Augment on GPU
+            # D. Augment & Train
             with torch.no_grad():
                 v1 = augmentor(batch)
                 v2 = augmentor(batch)
@@ -166,8 +160,7 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1} Avg Loss: {total_loss / num_batches:.4f}")
         
         if (epoch+1) % 10 == 0:
             torch.save(model.state_dict(), f"models/encoder_epoch_{epoch+1}.pth")
