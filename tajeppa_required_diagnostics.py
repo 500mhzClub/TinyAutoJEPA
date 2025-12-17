@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-tajeppa_required_diagnostics.py (safe for ROCm + DataLoader)
+tajeppa_required_diagnostics.py
 
-Produces:
-  (1) GPU batch line (first batch-like CUDA tensor; fallback largest)
-  (2) profiler table sorted by self_cuda_time_total
+Goal:
+  (1) Print GPU batch shape (first batch-like CUDA tensor; fallback to largest observed)
+  (2) Print profiler table sorted by self_cuda_time_total (stable autograd profiler)
+  (3) Stop after N optimizer steps reliably
 
-Stops after N optimizer steps by intercepting:
-  - torch.amp.GradScaler.step
-  - torch.cuda.amp.GradScaler.step
-  - optimizer.step for common optimizer subclasses
+Key fix vs prior versions:
+- Do NOT force num_workers=0 by default.
+- Instead, force DataLoader multiprocessing_context='spawn' when num_workers>0
+  to avoid "fork after GPU init" segfaults on ROCm/NVIDIA alike.
 
-IMPORTANT:
-- To avoid fork-after-GPU-init crashes, defaults to forcing DataLoader(num_workers=0).
-- When num_workers==0, also forces prefetch_factor=None and persistent_workers=False
-  (PyTorch requires that).
-Override workers:
-  export TAJEPA_FORCE_NUM_WORKERS=4
+Controls:
+- TAJEPA_FORCE_NUM_WORKERS: if set, overrides DataLoader num_workers
+- TAJEPA_FORCE_SPAWN: default 1; set 0 to disable spawn forcing (not recommended)
 """
 
 from __future__ import annotations
@@ -57,6 +55,8 @@ class State:
 
 def cand_from(t: torch.Tensor) -> Optional[Candidate]:
     try:
+        if not isinstance(t, torch.Tensor):
+            return None
         if not t.is_cuda:
             return None
         if t.numel() < 4096:
@@ -74,6 +74,7 @@ def cand_from(t: torch.Tensor) -> Optional[Candidate]:
 
 
 def looks_batch_like(c: Candidate) -> bool:
+    # Prefer 4D "image-ish" tensors, but accept large 3D token batches too.
     if len(c.shape) == 4:
         n = c.shape[0]
         h = c.shape[-2]
@@ -112,37 +113,72 @@ def main() -> int:
         print("[DIAG] ERROR: torch.cuda.is_available() is False.", file=sys.stderr)
         return 2
 
-    print(f"[DIAG] torch={torch.__version__} hip={torch.version.hip} device={torch.cuda.get_device_name(0)}")
+    # NOTE: train_encoder.py itself prints device info; avoid extra CUDA init here.
+    print(f"[DIAG] torch={torch.__version__} hip={torch.version.hip}")
     print(f"[DIAG] script={args.script} steps={args.steps} out={args.out}")
 
     st = State(printed=False, steps=0, best=None, t0=time.time())
 
-    # --- Patch DataLoader to force num_workers=N and fix related args ---
+    # --- Patch DataLoader to force spawn when num_workers>0, and handle prefetch_factor rules ---
+    import torch.multiprocessing as mp
     from torch.utils.data import DataLoader as _DataLoader
 
     orig_dl_init = _DataLoader.__init__
-    forced_workers = int(os.getenv("TAJEPA_FORCE_NUM_WORKERS", "0"))
+
+    force_spawn = os.getenv("TAJEPA_FORCE_SPAWN", "1") != "0"
+    force_workers_env = os.getenv("TAJEPA_FORCE_NUM_WORKERS", "")
+    force_workers = int(force_workers_env) if force_workers_env.strip() != "" else None
+
+    spawn_ctx = None
+    if force_spawn:
+        try:
+            mp.set_start_method("spawn", force=True)
+        except Exception:
+            pass
+        try:
+            spawn_ctx = mp.get_context("spawn")
+        except Exception:
+            spawn_ctx = None
 
     def patched_dl_init(self, *a, **kw):
-        # Force num_workers (positional index 5 or kw)
+        # Determine requested num_workers (positional index 5, or kw)
+        requested_workers = None
         if "num_workers" in kw:
-            kw["num_workers"] = forced_workers
+            requested_workers = kw["num_workers"]
+        else:
+            if len(a) > 5:
+                requested_workers = a[5]
+
+        if requested_workers is None:
+            requested_workers = 0
+
+        # Override if TAJEPA_FORCE_NUM_WORKERS is set
+        final_workers = force_workers if force_workers is not None else int(requested_workers)
+
+        # Apply num_workers back into args
+        if "num_workers" in kw:
+            kw["num_workers"] = final_workers
         else:
             if len(a) > 5:
                 a = list(a)
-                a[5] = forced_workers
+                a[5] = final_workers
                 a = tuple(a)
             else:
-                kw["num_workers"] = forced_workers
+                kw["num_workers"] = final_workers
 
-        # When single-process loading, PyTorch requires:
-        # - prefetch_factor must be None / unspecified
-        # - persistent_workers must be False
-        if forced_workers == 0:
+        # Enforce PyTorch invariants:
+        if final_workers == 0:
+            # prefetch_factor only valid when multiprocessing
             if "prefetch_factor" in kw:
                 kw["prefetch_factor"] = None
             if "persistent_workers" in kw:
                 kw["persistent_workers"] = False
+            if "multiprocessing_context" in kw:
+                kw.pop("multiprocessing_context", None)
+        else:
+            # Use spawn to avoid fork-after-GPU-init segfaults
+            if force_spawn and ("multiprocessing_context" not in kw) and (spawn_ctx is not None):
+                kw["multiprocessing_context"] = spawn_ctx
 
         return orig_dl_init(self, *a, **kw)
 
