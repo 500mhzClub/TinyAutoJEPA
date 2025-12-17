@@ -15,7 +15,7 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- LOSS ---
+# --- LOSS (Optimized) ---
 def off_diagonal(x):
     n, m = x.shape
     assert n == m
@@ -25,7 +25,6 @@ def off_diagonal(x):
     return x
 
 def vicreg_loss(x, y):
-    # Pure FP32 Math
     sim_loss = F.mse_loss(x, y)
     
     std_x = torch.sqrt(x.var(dim=0) + 1e-04)
@@ -42,13 +41,12 @@ def vicreg_loss(x, y):
     
     return (25.0 * sim_loss) + (25.0 * std_loss) + (1.0 * cov_loss)
 
-# --- GPU AUGMENTATION ---
+# --- AUGMENTATION ---
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
         self.transforms = nn.Sequential(
             v2.ToDtype(torch.float32, scale=True),
-            # Antialias=True is safer on RDNA4 than False (which can trigger special kernels)
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ColorJitter(brightness=0.2, contrast=0.2),
@@ -56,28 +54,22 @@ class GPUAugment(nn.Module):
         )
 
     def forward(self, x):
-        # Permute (B, H, W, C) -> (B, C, H, W)
+        # Input is (B, H, W, C) -> Permute to (B, C, H, W)
         x = x.permute(0, 3, 1, 2)
         return self.transforms(x)
 
-# --- FAST DATA LOADING ---
+# --- DATA LOADING ---
 def load_all_data(data_dir):
     print(f"Loading data from {data_dir}...")
     files = glob.glob(os.path.join(data_dir, "*.npz"))
-    
     np_images = []
     for f in tqdm(files, desc="Reading Disk"):
         try:
             np_images.append(np.load(f)['states']) 
         except: pass
-    
     np_images = np.concatenate(np_images, axis=0)
-    print(f"Numpy Loaded. Shape: {np_images.shape}")
-    
-    print("Moving to RAM Tensor...")
-    # Standard CPU Tensor. No pinning to avoid ROCm bugs.
-    data_tensor = torch.from_numpy(np_images)
-    return data_tensor
+    # Return as standard tensor
+    return torch.from_numpy(np_images)
 
 # --- MODEL ---
 class VICRegModel(nn.Module):
@@ -99,42 +91,45 @@ class VICRegModel(nn.Module):
 
 def train():
     os.makedirs("models", exist_ok=True)
-    
     all_data = load_all_data("data")
-    num_samples = len(all_data)
     
-    model = VICRegModel().to(DEVICE)
+    # --- CRITICAL FIX: CHANNELS LAST ---
+    # Convert model memory layout to NHWC (Channels Last)
+    # This is the native format for AMD RDNA accelerators
+    model = VICRegModel().to(DEVICE).to(memory_format=torch.channels_last)
     augmentor = GPUAugment().to(DEVICE)
     
-    # NO SCALER. NO AUTOCAST. PURE FP32.
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    print(f"Starting training on {DEVICE} (Force FP32 Mode)...")
+    print(f"Starting training on {DEVICE} (Channels Last Mode)...")
+    
+    num_samples = len(all_data)
+    num_batches = num_samples // BATCH_SIZE
     
     for epoch in range(EPOCHS):
-        total_loss = 0
-        
         indices = torch.randperm(num_samples)
-        num_batches = num_samples // BATCH_SIZE
-        
+        total_loss = 0
         pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for i in pbar:
             batch_idx = indices[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+            batch = all_data[batch_idx]
             
-            # Slice from RAM
-            batch = all_data[batch_idx] 
+            # Move to GPU
+            batch = batch.to(DEVICE, non_blocking=True)
             
-            # Move to GPU (Blocking is fine here as compute is fast)
-            batch = batch.to(DEVICE)
-            
+            # Augment
             with torch.no_grad():
                 v1 = augmentor(batch)
                 v2 = augmentor(batch)
             
+            # --- CRITICAL FIX: Convert Inputs ---
+            v1 = v1.to(memory_format=torch.channels_last)
+            v2 = v2.to(memory_format=torch.channels_last)
+            
             optimizer.zero_grad(set_to_none=True)
             
-            # --- PURE FP32 FORWARD ---
+            # Run
             _, z1 = model(v1)
             _, z2 = model(v2)
             loss = vicreg_loss(z1, z2)
@@ -146,11 +141,6 @@ def train():
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
         print(f"Epoch {epoch+1} Avg Loss: {total_loss / num_batches:.4f}")
-        
-        if (epoch+1) % 10 == 0:
-            torch.save(model.state_dict(), f"models/encoder_epoch_{epoch+1}.pth")
-
-    torch.save(model.state_dict(), "models/vicreg_encoder_final.pth")
 
 if __name__ == "__main__":
     train()
