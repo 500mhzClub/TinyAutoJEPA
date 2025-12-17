@@ -17,7 +17,7 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- LOSS ---
+# --- LOSS (Dynamic Shape) ---
 def off_diagonal(x):
     n, m = x.shape
     assert n == m
@@ -50,10 +50,8 @@ def vicreg_loss(x, y):
 class GPUAugment(nn.Module):
     def __init__(self):
         super().__init__()
+        # Removed 'PermuteDimensions' to prevent AttributeError
         self.transforms = nn.Sequential(
-            # 1. Permute on GPU (Fastest)
-            v2.PermuteDimensions(dims=(0, 3, 1, 2)), # (B, H, W, C) -> (B, C, H, W)
-            # 2. Convert to Float & Augment
             v2.ToDtype(torch.float32, scale=True),
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
@@ -63,6 +61,8 @@ class GPUAugment(nn.Module):
         )
 
     def forward(self, x):
+        # Manual Permute: (B, H, W, C) -> (B, C, H, W)
+        x = x.permute(0, 3, 1, 2)
         return self.transforms(x)
 
 # --- DATASET (SHARED MEMORY) ---
@@ -75,14 +75,12 @@ class SharedMemoryDataset(Dataset):
 
     def __getitem__(self, idx):
         # Zero processing. Just return the bytes.
-        # Returns (64, 64, 3) ByteTensor
         return self.data[idx]
 
 def load_data_to_shared_memory(data_dir):
     print(f"Loading data from {data_dir}...")
     files = glob.glob(os.path.join(data_dir, "*.npz"))
     
-    # 1. Load Numpy
     np_images = []
     for f in tqdm(files, desc="Reading Disk"):
         try:
@@ -92,11 +90,9 @@ def load_data_to_shared_memory(data_dir):
     np_images = np.concatenate(np_images, axis=0)
     print(f"Numpy Loaded. Shape: {np_images.shape}")
     
-    # 2. Convert to Shared Tensor
-    # We use uint8 (ByteTensor) to save 4x memory
     print("Moving to Shared Memory Tensor...")
     shared_tensor = torch.from_numpy(np_images)
-    shared_tensor.share_memory_() # <--- THE MAGIC SAUCE
+    shared_tensor.share_memory_() # Critical for Multiprocessing Speed
     
     print(f"Shared Tensor Ready. RAM: {shared_tensor.nelement() / 1e9:.2f} GB")
     return shared_tensor
@@ -126,13 +122,12 @@ def train():
     shared_data = load_data_to_shared_memory("data")
     dataset = SharedMemoryDataset(shared_data)
     
-    # 8 Workers reading from Shared Memory = Fast
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=8,       # Safe now because of share_memory_()
-        pin_memory=False,    # Disabled to rule out ROCm pinning issues
+        num_workers=8,       # High workers safe due to Shared Memory
+        pin_memory=False,    
         drop_last=True,
         persistent_workers=True
     )
@@ -150,10 +145,9 @@ def train():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for batch in pbar:
-            # batch is (B, 64, 64, 3) ByteTensor
             batch = batch.to(DEVICE, non_blocking=True)
             
-            # Augment (Includes Permute B,H,W,C -> B,C,H,W)
+            # Augment on GPU
             with torch.no_grad():
                 v1 = augmentor(batch)
                 v2 = augmentor(batch)
