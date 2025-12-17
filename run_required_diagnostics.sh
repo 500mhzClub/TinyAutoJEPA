@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Recommended environment for your current setup (adjust if you want)
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-12.0.0}"
 
-# Keep compile/inductor out of the picture unless explicitly testing it
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export TORCHINDUCTOR_DISABLE="${TORCHINDUCTOR_DISABLE:-1}"
 unset TORCH_LOGS || true
 
-# MIOpen settings (keep what you already use; do NOT force re-find here)
 export MIOPEN_USER_DB_PATH="${MIOPEN_USER_DB_PATH:-$HOME/.cache/miopen/userdb}"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-3}"
 unset MIOPEN_FIND_ENFORCE || true
