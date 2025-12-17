@@ -6,10 +6,9 @@ from torchvision import models
 import numpy as np
 import glob
 import os
-import sys
+import cv2  # The secret weapon for CPU speed
 from tqdm import tqdm
 from vicreg import vicreg_loss
-import kornia.augmentation as K
 
 # --- CONFIG ---
 BATCH_SIZE = 256
@@ -17,24 +16,44 @@ EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- KORNIA GPU PIPELINE ---
-class KorniaAugment(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # FIX: Removed 'antialias=True' which caused the TypeError.
-        # Kornia uses 'resample="BILINEAR"' by default which is safe/fast.
-        self.aug = K.AugmentationSequential(
-            K.RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0)), 
-            K.RandomHorizontalFlip(p=0.5),
-            K.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
-            K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
-            K.Normalize(mean=torch.tensor([0.485, 0.456, 0.406]), 
-                        std=torch.tensor([0.229, 0.224, 0.225])),
-            data_keys=["input"]
-        )
-
-    def forward(self, x):
-        return self.aug(x)
+# --- OPENCV AUGMENTATION (True Parallel CPU) ---
+def turbo_augment(img):
+    """
+    Performs augmentation using OpenCV (C++).
+    This releases the Python GIL, allowing true multi-core processing.
+    """
+    # img is (64, 64, 3) uint8
+    h, w, c = img.shape
+    
+    # 1. Random Resized Crop
+    # We cheat slightly: Random crop, then fast resize back to 64x64
+    scale = np.random.uniform(0.8, 1.0)
+    new_h, new_w = int(h * scale), int(w * scale)
+    
+    top = np.random.randint(0, h - new_h + 1)
+    left = np.random.randint(0, w - new_w + 1)
+    
+    # Slice (Zero copy, very fast)
+    crop = img[top:top+new_h, left:left+new_w]
+    # Linear resize is much faster than Bicubic and fine for ML
+    img = cv2.resize(crop, (64, 64), interpolation=cv2.INTER_LINEAR)
+    
+    # 2. Random Horizontal Flip
+    if np.random.rand() > 0.5:
+        img = cv2.flip(img, 1)
+        
+    # 3. Brightness/Contrast (Fast Matrix Ops)
+    if np.random.rand() > 0.2:
+        # alpha = contrast, beta = brightness
+        contrast = np.random.uniform(0.8, 1.2)
+        brightness = np.random.randint(-20, 20)
+        img = cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
+        
+    # 4. Gaussian Blur (Optional, helps VICReg)
+    if np.random.rand() > 0.5:
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+        
+    return img
 
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
@@ -53,8 +72,10 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        # Kornia expects (B, C, H, W)
-        self.images = np.transpose(self.images, (0, 3, 1, 2))
+        
+        # CRITICAL: OpenCV expects (H, W, Channels). 
+        # The .npz data is (N, 64, 64, 3). We keep it that way for OpenCV!
+        # (We do NOT transpose to (3, 64, 64) yet)
         
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
 
@@ -62,7 +83,19 @@ class CarRacingDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        return torch.from_numpy(self.images[idx])
+        # 1. Get raw image (64, 64, 3)
+        img = self.images[idx]
+        
+        # 2. Augment using C++ OpenCV (Releases GIL)
+        v1 = turbo_augment(img)
+        v2 = turbo_augment(img)
+        
+        # 3. Manual ToTensor (HWC -> CHW, 0-255 -> 0.0-1.0)
+        # Doing this manually is faster than torchvision.transforms.ToTensor
+        v1 = torch.from_numpy(v1).permute(2, 0, 1).float() / 255.0
+        v2 = torch.from_numpy(v2).permute(2, 0, 1).float() / 255.0
+        
+        return v1, v2
 
 class VICRegModel(nn.Module):
     def __init__(self):
@@ -92,39 +125,31 @@ def train():
     
     dataset = CarRacingDataset("data")
     
-    # 4 workers is plenty since CPU is just passing data
+    # 12 Workers to fully utilize the Ryzen 3600X
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=4, 
+        num_workers=12, 
         pin_memory=True, 
         persistent_workers=True
     )
     
     model = VICRegModel().to(DEVICE)
-    augmentor = KorniaAugment().to(DEVICE) 
-    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
 
-    print(f"Starting training on {DEVICE} (Kornia GPU Pipeline)...")
+    print(f"Starting training on {DEVICE} (OpenCV Turbo Mode)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for batch_imgs in pbar:
-            # 1. Move to GPU
-            batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
+        for view_1, view_2 in pbar:
+            # 1. Move Clean Tensors to GPU
+            view_1 = view_1.to(DEVICE, non_blocking=True)
+            view_2 = view_2.to(DEVICE, non_blocking=True)
             
-            # 2. Convert to Float
-            batch_imgs = batch_imgs.float() / 255.0
-            
-            # 3. Kornia Augment (GPU)
-            view_1 = augmentor(batch_imgs)
-            view_2 = augmentor(batch_imgs)
-            
-            # 4. Forward & Backward
+            # 2. Forward Pass (Pure Matrix Math on GPU)
             _, z1 = model(view_1)
             _, z2 = model(view_2)
             
