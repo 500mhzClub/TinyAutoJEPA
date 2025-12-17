@@ -4,25 +4,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
+from torchvision.transforms import v2  # GPU-accelerated transforms
 import numpy as np
 import glob
 import os
-import cv2
-from tqdm import tqdm
 import psutil
-
-# --- CRITICAL FIX 1: Prevent Thread Explosion ---
-# Forces OpenCV to run single-threaded. 
-# We rely on PyTorch DataLoaders (multiprocessing) for parallelism instead.
-cv2.setNumThreads(0)
+from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 256
+BATCH_SIZE = 512  # Increased: GPU augs allow larger batches
 EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
-# --- VICReg LOSS FUNCTIONS ---
+# --- LOSS ---
 def variance_loss(x, gamma=1.0):
     std = torch.sqrt(x.var(dim=0) + 1e-04)
     loss = torch.mean(F.relu(gamma - std))
@@ -42,44 +37,33 @@ def vicreg_loss(x, y):
     cov_loss = covariance_loss(x) + covariance_loss(y)
     return (25.0 * sim_loss) + (25.0 * std_loss) + (1.0 * cov_loss)
 
-# --- AUGMENTATION ---
-def turbo_augment(img):
-    h, w, c = img.shape
-    
-    # 1. Random Resized Crop
-    scale = np.random.uniform(0.8, 1.0)
-    new_h, new_w = int(h * scale), int(w * scale)
-    top = np.random.randint(0, h - new_h + 1)
-    left = np.random.randint(0, w - new_w + 1)
-    
-    crop = img[top:top+new_h, left:left+new_w]
-    img = cv2.resize(crop, (64, 64), interpolation=cv2.INTER_LINEAR)
-    
-    # 2. Random Horizontal Flip
-    if np.random.rand() > 0.5:
-        img = cv2.flip(img, 1)
-        
-    # 3. Brightness/Contrast
-    if np.random.rand() > 0.2:
-        contrast = np.random.uniform(0.8, 1.2)
-        brightness = np.random.randint(-20, 20)
-        img = cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
-        
-    # 4. Gaussian Blur
-    if np.random.rand() > 0.5:
-        img = cv2.GaussianBlur(img, (3, 3), 0)
-        
-    return img
+# --- GPU AUGMENTATION MODULE ---
+class GPUAugment(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transforms = nn.Sequential(
+            # Input is (B, 3, 64, 64) uint8 on GPU
+            v2.ToDtype(torch.float32, scale=True), # 0-255 -> 0.0-1.0
+            v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.ColorJitter(brightness=0.2, contrast=0.2),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.5),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        )
 
+    def forward(self, x):
+        return self.transforms(x)
+
+# --- DATASET (Now Dumb & Fast) ---
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
         print(f"Loading data from {data_dir}...")
         self.images = []
         files = glob.glob(os.path.join(data_dir, "*.npz"))
         
-        # Memory Safety Check
+        # Check RAM
         mem = psutil.virtual_memory()
-        print(f"RAM Available: {mem.available / 1e9:.2f} GB")
+        print(f"System RAM Available: {mem.available / 1e9:.2f} GB")
         
         for f in tqdm(files, desc="Loading Chunks"):
             try:
@@ -92,33 +76,25 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        print(f"Dataset Loaded. Size: {len(self.images)} images. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
+        print(f"Dataset Loaded. {len(self.images)} images. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        img = self.images[idx]
-        
-        # Augment twice
-        v1 = turbo_augment(img)
-        v2 = turbo_augment(img)
-        
-        # HWC -> CHW, Normalize
-        v1 = torch.from_numpy(v1).permute(2, 0, 1).float() / 255.0
-        v2 = torch.from_numpy(v2).permute(2, 0, 1).float() / 255.0
-        
-        return v1, v2
+        # FAST PATH: No processing here. Just strict copy.
+        img = self.images[idx] # (64, 64, 3)
+        # Permute needed because PyTorch wants (C, H, W)
+        # We return ByteTensor (uint8) to save bandwidth moving to GPU
+        return torch.from_numpy(img).permute(2, 0, 1)
 
 class VICRegModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Use standard ResNet18
         resnet = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
         
-        # 3-layer Projector per VICReg paper
         self.projector = nn.Sequential(
             nn.Linear(self.feature_dim, 2048),
             nn.BatchNorm1d(2048),
@@ -140,45 +116,47 @@ def train():
     
     dataset = CarRacingDataset("data")
     
-    # --- CRITICAL FIX 2: Tuned Workers ---
-    # Ryzen 3600X (6 cores) gets clogged with 12 workers + heavy augmentation.
-    # 6 is optimal.
+    # 4 Workers is plenty when they do zero processing
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=6, 
+        num_workers=4, 
         pin_memory=True, 
         persistent_workers=True,
         drop_last=True
     )
     
     model = VICRegModel().to(DEVICE)
+    augmentor = GPUAugment().to(DEVICE) # Augmentation lives on GPU now
     
-    # --- CRITICAL FIX 3: Torch Compile ---
-    # Fuses kernels for higher GPU utilization
-    print("Compiling model for RDNA 4...")
+    # Compile both for max speed on RDNA 4
+    # (Note: sometimes v2 transforms don't like compile, if it crashes, remove compile on augmentor)
+    print("Compiling model...")
     model = torch.compile(model)
+    # augmentor = torch.compile(augmentor) # Optional: Uncomment if stable
     
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
-    
-    # --- CRITICAL FIX 4: Mixed Precision Scaler ---
     scaler = torch.amp.GradScaler('cuda')
 
-    print(f"Starting training on {DEVICE}...")
+    print(f"Starting training on {DEVICE} (GPU Augmentation Mode)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for view_1, view_2 in pbar:
-            # Move to GPU
-            view_1 = view_1.to(DEVICE, non_blocking=True)
-            view_2 = view_2.to(DEVICE, non_blocking=True)
+        for batch in pbar:
+            # 1. Move Raw Uint8 Batch to GPU (Very fast)
+            batch = batch.to(DEVICE, non_blocking=True)
+            
+            # 2. Augment on GPU (Parallel & Fast)
+            with torch.no_grad():
+                view_1 = augmentor(batch)
+                view_2 = augmentor(batch)
             
             optimizer.zero_grad(set_to_none=True)
             
-            # --- CRITICAL FIX 5: BFloat16 Autocast ---
+            # 3. Forward & Loss (BFloat16)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 _, z1 = model(view_1)
                 _, z2 = model(view_2)
