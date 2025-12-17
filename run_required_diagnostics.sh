@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-12.0.0}"
+# Do NOT force HSA_OVERRIDE_GFX_VERSION here.
+# If you need it (e.g., gfx1200 workaround), export it before running this script.
+if [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]]; then
+  echo "Using HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION}"
+else
+  echo "HSA_OVERRIDE_GFX_VERSION is unset (recommended for gfx1030 / 6950 XT)"
+fi
 
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export TORCHINDUCTOR_DISABLE="${TORCHINDUCTOR_DISABLE:-1}"
