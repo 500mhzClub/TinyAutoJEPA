@@ -18,15 +18,13 @@ LEARNING_RATE = 3e-4
 DEVICE = "cuda"
 
 # --- KORNIA GPU PIPELINE ---
-# Kornia implements transforms using differentiable matrix math (grid_sample),
-# which bypasses the specific "upsample" driver bug on RDNA 4.
 class KorniaAugment(nn.Module):
     def __init__(self):
         super().__init__()
-        # We wrap it in a Sequential container
-        # same_on_batch=False ensures every image gets a DIFFERENT random crop
+        # FIX: Removed 'antialias=True' which caused the TypeError.
+        # Kornia uses 'resample="BILINEAR"' by default which is safe/fast.
         self.aug = K.AugmentationSequential(
-            K.RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0), antialias=True),
+            K.RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0)), 
             K.RandomHorizontalFlip(p=0.5),
             K.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1),
             K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
@@ -55,7 +53,7 @@ class CarRacingDataset(Dataset):
             raise RuntimeError("No data found!")
 
         self.images = np.concatenate(self.images, axis=0)
-        # Kornia expects (B, C, H, W) in float 0-1
+        # Kornia expects (B, C, H, W)
         self.images = np.transpose(self.images, (0, 3, 1, 2))
         
         print(f"Dataset Loaded. RAM Usage: {self.images.nbytes / 1e9:.2f} GB")
@@ -64,7 +62,6 @@ class CarRacingDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # Return raw uint8 tensor
         return torch.from_numpy(self.images[idx])
 
 class VICRegModel(nn.Module):
@@ -95,8 +92,7 @@ def train():
     
     dataset = CarRacingDataset("data")
     
-    # We reduce workers because the CPU does almost nothing now.
-    # It just hands memory to the GPU.
+    # 4 workers is plenty since CPU is just passing data
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
@@ -107,7 +103,7 @@ def train():
     )
     
     model = VICRegModel().to(DEVICE)
-    augmentor = KorniaAugment().to(DEVICE) # The Magic Fix
+    augmentor = KorniaAugment().to(DEVICE) 
     
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
 
@@ -118,13 +114,13 @@ def train():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for batch_imgs in pbar:
-            # 1. Move Raw Uint8 to GPU (Fast Transfer)
+            # 1. Move to GPU
             batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
             
-            # 2. Convert to Float (0-1) on GPU
+            # 2. Convert to Float
             batch_imgs = batch_imgs.float() / 255.0
             
-            # 3. Kornia Augmentation (Runs via matrix math, bypassing broken kernels)
+            # 3. Kornia Augment (GPU)
             view_1 = augmentor(batch_imgs)
             view_2 = augmentor(batch_imgs)
             
