@@ -6,15 +6,16 @@ Produces:
   (1) GPU batch line (first batch-like CUDA tensor; fallback largest)
   (2) profiler table sorted by self_cuda_time_total
 
-Reliably stops after N optimizer steps by intercepting:
+Stops after N optimizer steps by intercepting:
   - torch.amp.GradScaler.step
   - torch.cuda.amp.GradScaler.step
   - optimizer.step for common optimizer subclasses
 
-IMPORTANT: To avoid DataLoader worker segfaults (fork after GPU init),
-this wrapper forces DataLoader(num_workers=0) by default.
-
-Override if you insist:
+IMPORTANT:
+- To avoid fork-after-GPU-init crashes, defaults to forcing DataLoader(num_workers=0).
+- When num_workers==0, also forces prefetch_factor=None and persistent_workers=False
+  (PyTorch requires that).
+Override workers:
   export TAJEPA_FORCE_NUM_WORKERS=4
 """
 
@@ -116,20 +117,17 @@ def main() -> int:
 
     st = State(printed=False, steps=0, best=None, t0=time.time())
 
-    # --- Patch DataLoader to force num_workers=0 (prevents worker segfaults) ---
-    from torch.utils.data import DataLoader as _DataLoader  # noqa
+    # --- Patch DataLoader to force num_workers=N and fix related args ---
+    from torch.utils.data import DataLoader as _DataLoader
 
     orig_dl_init = _DataLoader.__init__
-
     forced_workers = int(os.getenv("TAJEPA_FORCE_NUM_WORKERS", "0"))
 
     def patched_dl_init(self, *a, **kw):
-        # DataLoader signature: (dataset, batch_size=1, shuffle=False, sampler=None,
-        # batch_sampler=None, num_workers=0, ...)
+        # Force num_workers (positional index 5 or kw)
         if "num_workers" in kw:
             kw["num_workers"] = forced_workers
         else:
-            # positional num_workers is index 5
             if len(a) > 5:
                 a = list(a)
                 a[5] = forced_workers
@@ -137,9 +135,14 @@ def main() -> int:
             else:
                 kw["num_workers"] = forced_workers
 
-        # If forcing 0, also prevent persistent_workers edge cases
-        if forced_workers == 0 and "persistent_workers" in kw:
-            kw["persistent_workers"] = False
+        # When single-process loading, PyTorch requires:
+        # - prefetch_factor must be None / unspecified
+        # - persistent_workers must be False
+        if forced_workers == 0:
+            if "prefetch_factor" in kw:
+                kw["prefetch_factor"] = None
+            if "persistent_workers" in kw:
+                kw["persistent_workers"] = False
 
         return orig_dl_init(self, *a, **kw)
 
