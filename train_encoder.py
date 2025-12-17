@@ -7,11 +7,10 @@ from torchvision.transforms import v2
 import numpy as np
 import glob
 import os
-import psutil
 from tqdm import tqdm
 
 # --- CONFIG ---
-BATCH_SIZE = 512  # Large batch for GPU efficiency
+BATCH_SIZE = 512
 EPOCHS = 50
 LEARNING_RATE = 3e-4
 DEVICE = "cuda"
@@ -26,6 +25,7 @@ def off_diagonal(x):
     return x
 
 def vicreg_loss(x, y):
+    # Pure FP32 Math
     sim_loss = F.mse_loss(x, y)
     
     std_x = torch.sqrt(x.var(dim=0) + 1e-04)
@@ -48,15 +48,15 @@ class GPUAugment(nn.Module):
         super().__init__()
         self.transforms = nn.Sequential(
             v2.ToDtype(torch.float32, scale=True),
+            # Antialias=True is safer on RDNA4 than False (which can trigger special kernels)
             v2.RandomResizedCrop(64, scale=(0.8, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ColorJitter(brightness=0.2, contrast=0.2),
-            v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.5),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         )
 
     def forward(self, x):
-        # (B, H, W, C) -> (B, C, H, W)
+        # Permute (B, H, W, C) -> (B, C, H, W)
         x = x.permute(0, 3, 1, 2)
         return self.transforms(x)
 
@@ -74,12 +74,9 @@ def load_all_data(data_dir):
     np_images = np.concatenate(np_images, axis=0)
     print(f"Numpy Loaded. Shape: {np_images.shape}")
     
-    # Convert to PyTorch Tensor immediately
-    # We keep it on CPU (Pin Memory) for fast transfer
-    print("Converting to Pinned Tensor...")
+    print("Moving to RAM Tensor...")
+    # Standard CPU Tensor. No pinning to avoid ROCm bugs.
     data_tensor = torch.from_numpy(np_images)
-    # pinning memory speeds up CPU->GPU transfer
-    # but we do it manually on the big tensor
     return data_tensor
 
 # --- MODEL ---
@@ -103,59 +100,47 @@ class VICRegModel(nn.Module):
 def train():
     os.makedirs("models", exist_ok=True)
     
-    # 1. Load Data
     all_data = load_all_data("data")
     num_samples = len(all_data)
     
     model = VICRegModel().to(DEVICE)
     augmentor = GPUAugment().to(DEVICE)
     
-    # Optional: Compile if your PyTorch/ROCm version supports it well
-    # model = torch.compile(model) 
-    
+    # NO SCALER. NO AUTOCAST. PURE FP32.
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scaler = torch.amp.GradScaler('cuda')
 
-    print(f"Starting training on {DEVICE} (Vectorized Loading)...")
+    print(f"Starting training on {DEVICE} (Force FP32 Mode)...")
     
     for epoch in range(EPOCHS):
         total_loss = 0
         
-        # 2. Manual Shuffle Indices
         indices = torch.randperm(num_samples)
-        
-        # 3. Manual Batch Loop (The key to speed)
-        # Instead of DataLoader, we slice chunks of the big tensor
         num_batches = num_samples // BATCH_SIZE
         
         pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for i in pbar:
-            # A. Get indices for this batch
             batch_idx = indices[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
             
-            # B. Slice directly (C-speed)
-            # This replaces 512 __getitem__ calls with 1 slice op
+            # Slice from RAM
             batch = all_data[batch_idx] 
             
-            # C. Move to GPU
-            batch = batch.to(DEVICE, non_blocking=True)
+            # Move to GPU (Blocking is fine here as compute is fast)
+            batch = batch.to(DEVICE)
             
-            # D. Augment & Train
             with torch.no_grad():
                 v1 = augmentor(batch)
                 v2 = augmentor(batch)
             
             optimizer.zero_grad(set_to_none=True)
             
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                _, z1 = model(v1)
-                _, z2 = model(v2)
-                loss = vicreg_loss(z1, z2)
+            # --- PURE FP32 FORWARD ---
+            _, z1 = model(v1)
+            _, z2 = model(v2)
+            loss = vicreg_loss(z1, z2)
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            optimizer.step()
             
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
