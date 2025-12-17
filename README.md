@@ -12,24 +12,9 @@ The end goal is a system that can "dream" driving trajectories and distinguish b
 
 This project is optimized for a dual-machine workflow to separate CPU-bound simulation from GPU-bound training.
 
-| Role | Machine Spec | Responsibility |
+| Role | Machine Spec |
 | :--- | :--- | :--- |
-| **The Factory** | **AMD Ryzen 5950X** + RX 6950 XT | **Data Generation.** Utilizes 32 threads to run 16+ parallel Box2D physics simulations significantly faster than a single core. |
-| **The Brain** | AMD Ryzen 3600X + **RX 9060 XT** | **Training.** Utilizes RDNA 4's Matrix Cores and native `bfloat16` support for efficient Transformer/MLP training. |
-
----
-
-## Prerequisites
-
-### Machine A (The Factory)
-* Python 3.10+
-* `pip install gymnasium[box2d] numpy opencv-python`
-
-### Machine B (The Brain)
-* Python 3.10+ (Linux Recommended for ROCm)
-* **ROCm 6.2+** (Required for RDNA 4 support)
-* `pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2`
-* `pip install gymnasium[box2d] matplotlib scikit-learn`
+| **The Factory** | **AMD Ryzen 5950X** + **RX 6950 XT** + **RX 9060 XT** |
 
 ---
 
