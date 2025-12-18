@@ -3,151 +3,90 @@ import numpy as np
 import cv2
 import glob
 import os
-import sys
 from networks import TinyEncoder, Predictor, TinyDecoder
 
-# --- Configuration ---
-# We use the "Preview Build" models you just trained
-ENCODER_PATH   = "./models/encoder_ep20.pth"
-PREDICTOR_PATH = "./models/predictor_ep10.pth" 
-DECODER_PATH   = "./models/decoder_ep5.pth"      # <--- We will wait for this one!
-DATA_PATH      = "./data/*.npz"
-DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- Config ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Using the NEW models
+ENCODER_PATH = "./models/encoder_final_mixed.pth"
+PREDICTOR_PATH = "./models/predictor_race_final.pth" # Or _epX.pth
+DECODER_PATH = "./models/decoder_race_final.pth"     # Or _epX.pth
+
+# Fallback to defaults if new ones aren't done yet
+if not os.path.exists(ENCODER_PATH): ENCODER_PATH = "./models/encoder_ep20.pth"
 
 def create_dream_video():
-    print(f"--- Generating Dream on {DEVICE} ---")
-    
-    # 1. Load the Trinity
     print("Loading models...")
-    
-    # Encoder
-    if not os.path.exists(ENCODER_PATH):
-        print(f"CRITICAL: {ENCODER_PATH} missing.")
-        return
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
-    encoder.eval()
-
-    # Predictor
-    if not os.path.exists(PREDICTOR_PATH):
-        print(f"CRITICAL: {PREDICTOR_PATH} missing.")
-        return
+    
     predictor = Predictor().to(DEVICE)
-    predictor.load_state_dict(torch.load(PREDICTOR_PATH, map_location=DEVICE))
-    predictor.eval()
-
-    # Decoder
-    if not os.path.exists(DECODER_PATH):
-        print(f"CRITICAL: {DECODER_PATH} missing. (Did you wait for Epoch 5?)")
-        # Fallback to checking for final if ep5 is missing
-        if os.path.exists("./models/decoder_final.pth"):
-            print("Found decoder_final.pth, using that instead.")
-            decoder_path = "./models/decoder_final.pth"
-        else:
-            return
-    else:
-        decoder_path = DECODER_PATH
-
+    # Try to load latest predictor
+    if os.path.exists(PREDICTOR_PATH): predictor.load_state_dict(torch.load(PREDICTOR_PATH, map_location=DEVICE))
+    else: print("WARNING: Using untrained predictor or wrong path!"); 
+    
     decoder = TinyDecoder().to(DEVICE)
-    decoder.load_state_dict(torch.load(decoder_path, map_location=DEVICE))
-    decoder.eval()
-
-    # 2. Load Data
-    files = glob.glob(DATA_PATH)
-    if not files:
-        print("No data files found.")
-        return
+    if os.path.exists(DECODER_PATH): decoder.load_state_dict(torch.load(DECODER_PATH, map_location=DEVICE))
     
-    # Load a random file
-    print(f"Loading data from {files[0]}...")
-    try:
-        data = np.load(files[0])
-        # Robust key fetch
-        if 'states' in data: 
-            obs = data['states']
-            actions = data['actions']
-        elif 'obs' in data:
-            obs = data['obs']
-            actions = data['action']
-        elif 'arr_0' in data:
-            obs = data['arr_0']
-            actions = data['arr_1']
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return
+    encoder.eval(); predictor.eval(); decoder.eval()
 
-    # 3. The Setup
-    # Start deeper in the episode to ensure movement
-    start_idx = 100 
-    seq_len = 120 # 2 seconds of dreaming
+    # Load a RACE file specifically to test the 'Good' physics
+    race_files = glob.glob("./data_race/*.npz")
+    if not race_files:
+        print("No race files found, using random data.")
+        race_files = glob.glob("./data/*.npz")
     
-    if len(obs) < start_idx + seq_len:
-        print("File too short for sequence length.")
-        return
+    data = np.load(race_files[0])
+    if 'states' in data: obs, actions = data['states'], data['actions']
+    else: obs, actions = data['obs'], data['action']
 
-    # Prepare initial frame (The "Seed")
-    seed_frame = torch.tensor(obs[start_idx]).float().to(DEVICE) / 255.0
-    if seed_frame.ndim == 3: seed_frame = seed_frame.unsqueeze(0) # (1, 3, 64, 64)
-    if seed_frame.shape[1] != 3: seed_frame = seed_frame.permute(0, 3, 1, 2) # Ensure NCHW
-
-    # Get the action sequence we actually took
-    action_seq = torch.tensor(actions[start_idx : start_idx+seq_len]).float().to(DEVICE)
-    if action_seq.ndim == 1: action_seq = action_seq.unsqueeze(1) # Ensure (T, 3)
-
-    print("Dreaming sequence...")
+    print(f"Dreaming from {race_files[0]}...")
+    
+    # Start sequence
+    start_idx = 200
+    seq_len = 100
+    
+    # 1. Encode Start
+    frame = torch.tensor(obs[start_idx]).float().to(DEVICE) / 255.0
+    if frame.shape[0] != 3: frame = frame.permute(2, 0, 1) # HWC->CHW
+    z = encoder(frame.unsqueeze(0))
+    
     frames = []
-
-    with torch.no_grad():
-        # A. Encode the starting point (The "Open Eye" Phase)
-        z = encoder(seed_frame)
-        
-        for t in range(seq_len):
-            # 1. Decode current thought (Visualization)
+    
+    for t in range(seq_len):
+        # Decode
+        with torch.no_grad():
             recon = decoder(z)
             
-            # 2. Predict next state (The "Brain" Step)
-            # Unsqueeze action to match batch size (1, 3)
-            current_action = action_seq[t].unsqueeze(0) 
-            z_next = predictor(z, current_action)
+            # Predict Next
+            act = torch.tensor(actions[start_idx+t]).float().to(DEVICE).unsqueeze(0)
+            z = predictor(z, act)
             
-            # 3. Update state (Closed Loop: Input is previous output)
-            z = z_next
+        # Vis
+        r_img = obs[start_idx+t] # HWC
+        d_img = recon.squeeze(0).cpu().permute(1,2,0).numpy() * 255
+        d_img = d_img.clip(0,255).astype(np.uint8)
+        
+        # BGR
+        r_bgr = cv2.cvtColor(r_img, cv2.COLOR_RGB2BGR)
+        d_bgr = cv2.cvtColor(d_img, cv2.COLOR_RGB2BGR)
+        
+        # Scale
+        s = 4
+        h, w = r_bgr.shape[:2]
+        r_big = cv2.resize(r_bgr, (w*s, h*s), interpolation=0)
+        d_big = cv2.resize(d_bgr, (w*s, h*s), interpolation=0)
+        
+        combined = np.hstack((r_big, d_big))
+        cv2.putText(combined, "Reality", (10,30), 0, 1, (0,255,0), 2)
+        cv2.putText(combined, "Dream", (w*s+10,30), 0, 1, (0,0,255), 2)
+        frames.append(combined)
 
-            # --- Visualization Processing ---
-            # Get Real Frame
-            real_img = obs[start_idx + t] # HWC, 0-255
-            
-            # Get Dream Frame
-            dream_img = recon.squeeze(0).permute(1,2,0).cpu().numpy() # HWC, 0-1
-            dream_img = (dream_img * 255).clip(0, 255).astype(np.uint8)
-            
-            # Convert to BGR for OpenCV
-            real_bgr = cv2.cvtColor(real_img, cv2.COLOR_RGB2BGR)
-            dream_bgr = cv2.cvtColor(dream_img, cv2.COLOR_RGB2BGR)
-            
-            # Resize for visibility (Zoom x4)
-            scale = 4
-            h, w = real_bgr.shape[:2]
-            real_big = cv2.resize(real_bgr, (w*scale, h*scale), interpolation=cv2.INTER_NEAREST)
-            dream_big = cv2.resize(dream_bgr, (w*scale, h*scale), interpolation=cv2.INTER_NEAREST)
-            
-            # Labels
-            cv2.putText(real_big, "REALITY", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(dream_big, "DREAM (Closed Eyes)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            
-            # Stitch
-            combined = np.hstack((real_big, dream_big))
-            frames.append(combined)
-
-    # 4. Save Video
-    out_path = 'dream_result.avi'
-    height, width, _ = frames[0].shape
-    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'DIVX'), 30, (width, height))
-    
-    for f in frames:
-        out.write(f)
+    # Save
+    out = cv2.VideoWriter('dream_race.avi', cv2.VideoWriter_fourcc(*'DIVX'), 30, (frames[0].shape[1], frames[0].shape[0]))
+    for f in frames: out.write(f)
     out.release()
-    print(f"Saved {out_path} - Open this file to see the dream!")
+    print("Saved dream_race.avi")
 
 if __name__ == "__main__":
     create_dream_video()
