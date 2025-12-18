@@ -33,6 +33,25 @@ class Projector(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class Predictor(nn.Module):
+    def __init__(self, input_dim=512, action_dim=3, hidden_dim=512):
+        super().__init__()
+        # Input: State Embedding (512) + Action (3: steer, gas, brake)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + action_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim) # Output: Predicted Next State Embedding
+        )
+
+    def forward(self, z, action):
+        # Concatenate State and Action
+        x = torch.cat([z, action], dim=1)
+        return self.net(x)
+
 class TinyDecoder(nn.Module):
     def __init__(self, latent_dim=512):
         super().__init__()
