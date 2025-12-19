@@ -14,9 +14,9 @@ EPOCHS = 20
 LR = 1e-3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-ENCODER_PATH = "./models/encoder_final_mixed.pth"
+ENCODER_PATH = "./models/encoder_fine_ep10.pth"
 if not os.path.exists(ENCODER_PATH): 
-    ENCODER_PATH = "./models/encoder_ep20.pth"
+    ENCODER_PATH = "./models/encoder_fine_ep10.pth"
 
 class CombinedImageDataset(Dataset):
     def __init__(self):

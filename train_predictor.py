@@ -15,9 +15,9 @@ LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Points to the encoder we just fine-tuned
-ENCODER_PATH = "./models/encoder_final_mixed.pth" 
+ENCODER_PATH = "./models/encoder_fine_ep10.pth" 
 if not os.path.exists(ENCODER_PATH): 
-    ENCODER_PATH = "./models/encoder_ep20.pth"
+    ENCODER_PATH = "./models/encoder_fine_ep10.pth"
 
 class CombinedDynamicsDataset(Dataset):
     def __init__(self):
