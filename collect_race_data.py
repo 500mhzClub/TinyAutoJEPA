@@ -29,7 +29,6 @@ def get_cheat_action(env):
     closest_idx = np.argmin(dists)
     
     # Look Ahead (Target the track 6 tiles forward)
-    # This value (6) determines how "aggressive" the cutting is.
     target_idx = (closest_idx + 6) % len(track)
     target = np.array(track[target_idx][2:4])
     
@@ -47,27 +46,32 @@ def get_cheat_action(env):
     if abs(steer) > 0.5: gas, brake = 0.0, 0.0 # Coast through sharp turns
     else: gas, brake = 0.6, 0.0
         
-    return np.array([steer, gas, brake])
+    return np.array([steer, gas, brake], dtype=np.float32)
 
 def collect():
     print(f"Collecting RACE data to {DATA_DIR}...")
     
-    # --- UPDATED: Use v3 ---
+    # Use v3 (gymnasium standard)
     try:
         env = gym.make("CarRacing-v3", render_mode="rgb_array")
     except Exception as e:
         print(f"Error making env: {e}")
-        print("Trying fallback to v2 just in case...")
         env = gym.make("CarRacing-v2", render_mode="rgb_array")
     
     obs_buffer, act_buffer = [], []
     file_count = 0
     total_frames = 0
     
+    # Define a zero action as a numpy array for the skip loop
+    zero_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
     for episode in range(NUM_EPISODES):
         obs, _ = env.reset()
+        
         # Skip zoom-in (Wait for car to land)
-        for _ in range(50): obs, _, _, _, _ = env.step([0,0,0])
+        # FIX: Pass numpy array, not list
+        for _ in range(50): 
+            obs, _, _, _, _ = env.step(zero_action)
 
         done = False
         while not done:
