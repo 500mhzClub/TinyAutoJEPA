@@ -5,17 +5,18 @@ from torchvision import transforms
 import numpy as np
 import glob
 import os
+import cv2  # <--- NEW: For resizing
 from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
 # --- Configuration ---
 BATCH_SIZE = 256
-EPOCHS = 20  # Fine-tuning doesn't need 50 epochs
-LR = 1e-4    # Moderate LR for fine-tuning
+EPOCHS = 20  
+LR = 1e-4    
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Combined Dataset ---
+# --- Combined Dataset with Auto-Resize ---
 class CombinedDataset(Dataset):
     def __init__(self):
         # Load BOTH folders
@@ -31,15 +32,24 @@ class CombinedDataset(Dataset):
                     if 'states' in arr: obs = arr['states']
                     elif 'obs' in arr: obs = arr['obs']
                     else: continue
+                    
+                    # --- AUTO-RESIZE FIX ---
+                    # If image is 96x96 (Gym v1.0 default), resize to 64x64
+                    if obs.shape[1] == 96:
+                        # Process batch using list comprehension (fast enough for loading)
+                        obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
+                    # -----------------------
+
                     self.data_list.append(obs)
-            except: pass
+            except Exception as e:
+                pass
             
         self.data = np.concatenate(self.data_list, axis=0)
         self.data = np.transpose(self.data, (0, 3, 1, 2)) # NHWC -> NCHW
         print(f"Total Combined Frames: {len(self.data)}")
 
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(64, scale=(0.7, 1.0)), # Less aggressive crop for racing
+            transforms.RandomResizedCrop(64, scale=(0.7, 1.0)), 
             transforms.RandomHorizontalFlip(p=0.2),
             transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
             transforms.GaussianBlur(3),
@@ -62,7 +72,6 @@ def train():
     scaler = torch.amp.GradScaler('cuda')
 
     # --- SMART RESUME ---
-    # We want to KEEP your current knowledge
     start_epoch = 0
     if os.path.exists("./models/encoder_final.pth"):
         path = "./models/encoder_final.pth"

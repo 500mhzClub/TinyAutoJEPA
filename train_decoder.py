@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import glob
 import os
+import cv2 # <--- NEW
 from tqdm import tqdm
 from networks import TinyEncoder, TinyDecoder
 
@@ -13,7 +14,6 @@ EPOCHS = 20
 LR = 1e-3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Must match Predictor's encoder source
 ENCODER_PATH = "./models/encoder_final_mixed.pth"
 if not os.path.exists(ENCODER_PATH): 
     ENCODER_PATH = "./models/encoder_ep20.pth"
@@ -28,6 +28,12 @@ class CombinedImageDataset(Dataset):
                     if 'states' in arr: obs = arr['states']
                     elif 'obs' in arr: obs = arr['obs']
                     else: continue
+
+                    # --- AUTO-RESIZE FIX ---
+                    if obs.shape[1] == 96:
+                        obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
+                    # -----------------------
+
                     self.data_list.append(obs)
             except: pass
         self.data = np.concatenate(self.data_list, axis=0)

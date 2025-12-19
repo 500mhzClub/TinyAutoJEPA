@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import glob
 import os
+import cv2 # <--- NEW
 from tqdm import tqdm
 from networks import TinyEncoder, Predictor
 
@@ -15,7 +16,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Points to the encoder we just fine-tuned
 ENCODER_PATH = "./models/encoder_final_mixed.pth" 
-# Fallback if you haven't finished fine-tuning yet
 if not os.path.exists(ENCODER_PATH): 
     ENCODER_PATH = "./models/encoder_ep20.pth"
 
@@ -29,13 +29,17 @@ class CombinedDynamicsDataset(Dataset):
         for f in self.files:
             try:
                 with np.load(f) as arr:
-                    # Robust Fetch
                     if 'states' in arr: o, a = arr['states'], arr['actions']
                     elif 'obs' in arr: o, a = arr['obs'], arr['action']
                     else: continue
                     
                     if len(o) != len(a): min_l = min(len(o), len(a)); o=o[:min_l]; a=a[:min_l]
                     if len(o) < 2: continue
+
+                    # --- AUTO-RESIZE FIX ---
+                    if o.shape[1] == 96:
+                        o = np.array([cv2.resize(img, (64, 64)) for img in o])
+                    # -----------------------
 
                     self.obs_list.append(o[:-1])
                     self.act_list.append(a[:-1])
@@ -59,14 +63,12 @@ class CombinedDynamicsDataset(Dataset):
 def train():
     print(f"Training Predictor (New Physics) on {DEVICE}")
     
-    # Load Frozen Encoder
     encoder = TinyEncoder().to(DEVICE)
     print(f"Loading Encoder from: {ENCODER_PATH}")
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
     for p in encoder.parameters(): p.requires_grad = False
 
-    # New Predictor (Fresh Start)
     predictor = Predictor().to(DEVICE)
     optimizer = optim.Adam(predictor.parameters(), lr=LR)
     criterion = nn.MSELoss()
