@@ -5,7 +5,7 @@ import math
 import time
 
 # --- Configuration ---
-NUM_EPISODES = 20       # Approx 20k frames
+NUM_EPISODES = 20       # ~20k frames
 DATA_DIR = "./data_race" 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -13,8 +13,15 @@ def get_cheat_action(env):
     """
     Accesses environment internals to drive perfectly on the center line.
     """
-    car = env.unwrapped.car
-    track = env.unwrapped.track
+    # Gymnasium v1.0+ unwrapping structure
+    if hasattr(env.unwrapped, 'car'):
+        car = env.unwrapped.car
+        track = env.unwrapped.track
+    else:
+        # Fallback if the env is wrapped differently
+        car = env.car
+        track = env.track
+
     car_pos = np.array(car.hull.position)
     
     # Find closest track point
@@ -22,33 +29,44 @@ def get_cheat_action(env):
     closest_idx = np.argmin(dists)
     
     # Look Ahead (Target the track 6 tiles forward)
+    # This value (6) determines how "aggressive" the cutting is.
     target_idx = (closest_idx + 6) % len(track)
     target = np.array(track[target_idx][2:4])
     
     # Calculate Steering Angle
     angle_to_target = math.atan2(target[1] - car_pos[1], target[0] - car_pos[0])
     diff = angle_to_target - car.hull.angle
+    
+    # Normalize angle difference to [-pi, pi]
     while diff > math.pi: diff -= 2*math.pi
     while diff < -math.pi: diff += 2*math.pi
     
     steer = np.clip(diff * 10.0, -1.0, 1.0)
     
     # Gas Logic: Slow down for turns, gas on straights
-    if abs(steer) > 0.5: gas, brake = 0.0, 0.0
+    if abs(steer) > 0.5: gas, brake = 0.0, 0.0 # Coast through sharp turns
     else: gas, brake = 0.6, 0.0
         
     return np.array([steer, gas, brake])
 
 def collect():
     print(f"Collecting RACE data to {DATA_DIR}...")
-    env = gym.make("CarRacing-v2", render_mode="rgb_array")
+    
+    # --- UPDATED: Use v3 ---
+    try:
+        env = gym.make("CarRacing-v3", render_mode="rgb_array")
+    except Exception as e:
+        print(f"Error making env: {e}")
+        print("Trying fallback to v2 just in case...")
+        env = gym.make("CarRacing-v2", render_mode="rgb_array")
     
     obs_buffer, act_buffer = [], []
     file_count = 0
+    total_frames = 0
     
     for episode in range(NUM_EPISODES):
         obs, _ = env.reset()
-        # Skip zoom-in
+        # Skip zoom-in (Wait for car to land)
         for _ in range(50): obs, _, _, _, _ = env.step([0,0,0])
 
         done = False
@@ -60,14 +78,17 @@ def collect():
             obs_buffer.append(obs)
             act_buffer.append(action)
             obs = next_obs
+            total_frames += 1
             
             # Save every 1000 frames
             if len(obs_buffer) >= 1000:
                 fname = f"{DATA_DIR}/race_{int(time.time())}_{file_count}.npz"
                 np.savez_compressed(fname, states=np.array(obs_buffer), actions=np.array(act_buffer))
-                print(f"Saved chunk {file_count}")
+                print(f"Saved chunk {file_count} | Total Frames: {total_frames}")
                 file_count += 1
                 obs_buffer, act_buffer = [], []
+                
+        print(f"Episode {episode+1}/{NUM_EPISODES} finished.")
                 
     env.close()
     print("Race Data Collection Complete.")
