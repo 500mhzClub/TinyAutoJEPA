@@ -1,132 +1,145 @@
-# TinyJEPA: A Minimal World Model 
+# TinyAutoJEPA: Self-Supervised World Model Pilot
 
-**TinyJEPA** is a practical implementation of a **Joint Embedding Predictive Architecture (JEPA)**.
+TinyAutoJEPA is an autonomous driving system based on Joint Embedding Predictive Architecture (JEPA). It focuses on learning the dynamics of an environment through self-supervised observation rather than direct imitation.
 
-Unlike standard AI that predicts the next *word*, this project builds a World Model that learns the physics of a driving environment (`CarRacing-v2`) purely from visual observation. It uses **VICReg** regularization to prevent representation collapse and **Latent Dynamics** to imagine future states.
+Unlike standard Imitation Learning, which clones human actions directly, this system builds a "World Model"—an internal representation of physics and causality. It learns to distinguish surface properties (e.g., grass vs. road) and predicts future states based on current actions before being tasked with driving.
 
-The end goal is a system that can "dream" driving trajectories and distinguish between **plausible futures** (low energy) and **impossible futures** (high energy).
+## Hardware Configuration
 
----
+This project is configured for a high-performance AMD workstation running Linux.
 
-## Architecture & Hardware Strategy
-
-This project is optimized for a dual-machine workflow to separate CPU-bound simulation from GPU-bound training.
-
-| Role | Machine Spec |
+| Component | Specification | Function |
 | :--- | :--- | :--- |
-| **The Factory** | **AMD Ryzen 5950X** + **RX 6950 XT** + **RX 9060 XT** |
+| **CPU** | **AMD Ryzen 9 5950X** (16C/32T) | Handles parallel data loading and image preprocessing. Utilizes multi-threading to ensure the GPU is constantly supplied with data, preventing bottlenecks during resizing operations. |
+| **GPU 1** | **AMD Radeon RX 6950 XT** (16GB) | Primary compute unit for training. Leverages **ROCm** for hardware acceleration and Mixed Precision (`torch.amp`) training. The 16GB VRAM buffer accommodates large batch sizes (256+). |
+| **GPU 2** | **9060 XT** | Secondary compute or display output unit. |
+| **RAM** | **64 GB DDR4** | Facilitates OS-level caching of the dataset (approx. 1M frames), minimizing disk I/O latency during repeated training epochs. |
+| **OS** | **Pop!_OS (Linux)** | Selected for native ROCm kernel support and efficient thread scheduling. |
 
----
+### Estimated Training Times
 
-## The 4-Day Plan
+| Component | Epochs | Duration per Epoch (Approx) | Description |
+| :--- | :--- | :--- | :--- |
+| **Encoder (Initial)** | 50 (Scratch) | ~52 mins | Base feature learning on initial random dataset. |
+| **Encoder (Update)** | 20 (Fine-Tune) | ~50 mins | Adaptation to mixed dataset (Road + Grass). Computationally intensive due to dataset size. |
+| **Predictor** | 30 | ~20 mins | Fast training. Optimization of latent vector dynamics. |
+| **Decoder** | 20 | ~25 mins | Moderate intensity. Optimization of image reconstruction for visualization. |
 
-### Day 1: The "Multiverse" (Data Collection)
-**Objective:** Create a "Memory Bank" of physics.
-Before the AI can predict physics, it must observe cause and effect. We collect **Triplets**: `(State_t, Action_t, State_t+1)`.
+## Installation & Setup
 
-* **Script:** `collect_data.py`
-* **Task:** Run 16 parallel agents on the 5950X.
-* **Target:** 50,000 - 100,000 frames.
-* **Output:** Compressed `.npz` or `.pt` files containing trajectory chunks.
-* **Key Concept:** **Experience Replay** — Storing past interactions to learn offline.
+### 1. Environment Configuration
+Ensure AMD ROCm drivers are correctly installed on the host system.
 
-### Day 2: The "Eye" (VICReg Encoder)
-**Objective:** Learn to "see" without labels.
-We train a **ResNet-18** to compress 64x64 images into 512-dim embeddings. To prevent the model from "cheating" (outputting all zeros), we use **VICReg Loss**.
-
-* **Script:** `train_encoder.py`
-* **Loss Function:**
-    1.  **Variance:** Forces embeddings to differ across the batch (prevents collapse).
-    2.  **Invariance:** Forces two augmented views of the same image to match.
-    3.  **Covariance:** Forces embedding dimensions to be independent (maximizes information).
-* **Hardware Tip:** Use `torch.bfloat16` on the RX 9060 XT for 2x speedup.
-
-### Day 3: The "Brain" (Latent Predictor)
-**Objective:** Learn the physics of the latent space.
-We freeze the Encoder and train a Predictor Network (MLP) to model the flow of time.
-$$P(z_t, action_t) \approx z_{t+1}$$
-
-* **Script:** `train_predictor.py`
-* **Architecture:** 3-Layer MLP or small Transformer Block.
-* **Task:** Minimize MSE between the *Predicted Future Embedding* and the *Actual Future Embedding*.
-* **Optional:** Train a `Decoder` to visualize the "dreamt" embeddings as blurry images.
-
-### Day 4: The "Judge" (Energy & Inference)
-**Objective:** Detect impossible futures.
-We use the trained JEPA to evaluate "Energy" (Compatibility).
-* **Real Future:** Low Distance (Energy) between Prediction and Proposal.
-* **Fake Future:** High Distance (Energy).
-
-* **Script:** `demo_energy.py`
-* **The Demo:** A live window showing the car driving, with a real-time graph plotting the Energy of the current state vs. a random/teleporting state.
-
----
-
-## Repository Structure
-
-```text
-/tiny_jepa
-├── /data                # Raw .npz or .pt files (GitIgnored)
-├── /models              # Saved .pth weights
-├── buffer.py            # Data collection logic & Dataset class
-├── networks.py          # ResNet Encoder, MLP Predictor, Decoder
-├── vicreg.py            # The VICReg Loss Function implementation
-├── collect_data.py      # (Day 1) Multiprocessing generation script
-├── train_encoder.py     # (Day 2) Self-Supervised training
-├── train_predictor.py   # (Day 3) Latent Dynamics training
-└── demo_energy.py       # (Day 4) The final visualization
-
-```
-
-## Theory & ReferencesThis project is built on concepts from:
-
-* **VICReg: Variance-Invariance-Covariance Regularization** (Bardes, Ponce, LeCun, 2021)
-* [Paper](https://arxiv.org/abs/2105.04906) | [Meta AI Blog](https://www.google.com/search?q=https://ai.meta.com/blog/vicreg-variance-invariance-covariance-regularization-for-self-supervised-learning/)
-
-
-* **JEPA: Joint Embedding Predictive Architecture** (LeCun, 2022)
-* [A Path Towards Autonomous Machine Intelligence](https://openreview.net/pdf?id=BZ5a1r-kVsf)
-
-
-* **World Models** (Ha, Schmidhuber, 2018)
-* [Interactive Paper](https://worldmodels.github.io/)
-
-
-
----
-
-## Quick Start1. **Generate Data (Machine A):**
 ```bash
-sudo apt install swig build-essential python3-dev
-
-python3 -m venv venv
-
+# Create Virtual Environment
+python -m venv venv
 source venv/bin/activate
 
-pip install --upgrade pip
-pip install -r requirements.txt
+# Install PyTorch for ROCm (Verify version match at pytorch.org)
+pip install torch torchvision --index-url [https://download.pytorch.org/whl/rocm6.0](https://download.pytorch.org/whl/rocm6.0)
 
-python collect_data.py
+# Install Project Dependencies
+pip install gymnasium[box2d] opencv-python numpy tqdm matplotlib
 
 ```
 
+### 2. Gymnasium Versioning
 
-2. **Train Encoder (Machine B):**
+This project utilizes `CarRacing-v3`. Ensure the library is up to date to prevent physics engine deprecation errors.
+
 ```bash
-python train_encoder.py --epochs 50 --batch_size 256
+pip install --upgrade gymnasium swig
 
 ```
 
+## Training Pipeline
 
-3. **Train Predictor (Machine B):**
+The training strategy employs a balanced dataset consisting of 50% random exploration data (off-road recovery) and 50% expert driving data (lane keeping).
+
+### Step 1: Data Generation
+
+Generates expert trajectory data using an algorithmic solver.
+
 ```bash
-python train_predictor.py --epochs 50
+python collect_race_data.py
+# Output: ./data_race/*.npz (~20k frames)
 
 ```
 
+### Step 2: Encoder Training
 
-4. **Run Demo (Machine B):**
+Fine-tunes the visual encoder. This step resumes from previous checkpoints to retain basic feature recognition while adapting to specific road features found in the new dataset.
+
 ```bash
-python demo_energy.py
+python train_encoder.py
 
 ```
+
+### Step 3: Predictor Training
+
+Trains the latent dynamics model. This process starts from scratch to ensure the model learns a cohesive physics representation of both asphalt and grass surfaces without bias from previous iterations.
+
+```bash
+python train_predictor.py
+
+```
+
+### Step 4: Decoder Training
+
+Trains the reconstruction model. This component is required only for human verification of the latent state representation.
+
+```bash
+python train_decoder.py
+
+```
+
+### Step 5: Visualization
+
+Generates a batch of video files comparing the model's predicted future trajectories against the ground truth.
+
+```bash
+python visualize_batch.py
+# Output: dream_batch_*.avi
+
+```
+
+## Component Architecture
+
+### 1. The Encoder (`TinyEncoder`)
+
+**Layman Explanation:**
+The Encoder functions as the system's vision. It compresses raw, high-dimensional image data (pixels) into a compact summary vector. This vector allows the system to process the scene's content (e.g., "curve ahead") without processing every individual pixel.
+
+**Technical Detail:**
+The architecture is a modified **ResNet18** backbone. Max-pooling layers have been removed to preserve spatial granularity essential for the 64x64 input resolution. Training utilizes **VICReg** (Variance-Invariance-Covariance Regularization), a self-supervised loss function that prevents mode collapse and ensures high-quality feature representations without requiring negative sample pairs.
+
+### 2. The Predictor (`Predictor`)
+
+**Layman Explanation:**
+The Predictor functions as the system's internal simulator. It takes the current state summary and a proposed action (e.g., "steer left") to calculate the likely outcome. It learns physics rules, such as the relationship between surface friction and acceleration.
+
+**Technical Detail:**
+This is a 3-layer **Multi-Layer Perceptron (MLP)**.
+
+* **Input:** Concatenation of the Latent State () and Action vector ().
+* **Output:** Predicted Next Latent State ().
+* **Objective:** Minimize the Mean Squared Error (MSE) between the predicted next state vector and the actual encoded next state.
+
+### 3. The Decoder (`TinyDecoder`)
+
+**Layman Explanation:**
+The Decoder translates the internal numerical summaries back into visible images. This allows developers to visually inspect the system's "imagination" and verify accuracy.
+
+**Technical Detail:**
+The architecture is a **Transposed Convolutional Network** (Inverse ResNet). It projects the 512-dimensional latent vector into a 4x4 spatial feature map and progressively upsamples it to the original 64x64 resolution using learned convolutional filters.
+
+## Future Implementation (Model Predictive Control)
+
+The current system is a passive observer. The next phase involves implementing Model Predictive Control (MPC) to enable active driving.
+
+**MPC Workflow:**
+
+1. **Simulation:** The model generates multiple random action sequences.
+2. **Prediction:** The Predictor estimates the future state for each sequence.
+3. **Evaluation:** A cost function scores the predicted states (e.g., higher score for high speed and low distance from the track center).
+4. **Execution:** The action sequence with the optimal score is executed.
