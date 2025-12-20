@@ -75,7 +75,7 @@ def train():
     scaler = torch.amp.GradScaler('cuda')
 
     dataset = CombinedDynamicsDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
 
     for epoch in range(EPOCHS):
         predictor.train()
