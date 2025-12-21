@@ -8,7 +8,7 @@ import time
 
 # --- CONFIGURATION ---
 VISUAL_VERIFY = False    # Set to TRUE to watch a full lap. Set to FALSE to generate data.
-NUM_WORKERS = 12         
+NUM_WORKERS = 32         
 EPISODES_PER_WORKER = 20 # Reduced count because episodes are 3x longer now
 MAX_STEPS = 3000         # Increased to ~60 seconds to allow FULL LAPS
 DATA_DIR = "data_race"   
