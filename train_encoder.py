@@ -12,9 +12,23 @@ from vicreg import vicreg_loss
 
 # --- Configuration ---
 BATCH_SIZE = 256
-EPOCHS = 30  # Increased slightly for the new diverse data
+EPOCHS = 30
 LR = 1e-4    
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Hardware Check ---
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0") # Force default GPU
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"\n🖥️  HARDWARE ACCELERATION ENABLED")
+    print(f"   --------------------------------")
+    print(f"   Active GPU:  {gpu_name}")
+    print(f"   VRAM Buffer: {gpu_mem:.2f} GB")
+    print(f"   Device ID:   {DEVICE}")
+    print(f"   --------------------------------\n")
+else:
+    DEVICE = torch.device("cpu")
+    print("\n⚠️  WARNING: No GPU detected. Training will be extremely slow.\n")
 
 # --- Balanced Dataset ---
 class BalancedDataset(Dataset):
@@ -33,10 +47,13 @@ class BalancedDataset(Dataset):
         print(f"\n📊 Balancing Strategy:")
         print(f"   - Random Frames: {n_random:,}")
         print(f"   - Race Frames:   {n_race:,}")
+        
+        if min_len == 0:
+            raise ValueError("❌ One of the datasets is empty! Check your folders.")
+
         print(f"   - Target Count:  {min_len:,} per group (50/50 split)")
         
-        # 3. Undersample the Majority Class to match Minority
-        # This prevents the model from ignoring the "rare" events (physics on grass)
+        # 3. Undersample the Majority Class
         idx_random = np.random.choice(n_random, min_len, replace=False)
         idx_race   = np.random.choice(n_race, min_len, replace=False)
         
@@ -54,10 +71,10 @@ class BalancedDataset(Dataset):
         self.data = np.transpose(self.data, (0, 3, 1, 2)) 
         print(f"✅ Final Dataset Size: {len(self.data):,} frames")
 
-        # 5. Augmentations (Crucial for Representation Learning)
+        # 5. Augmentations
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(64, scale=(0.7, 1.0)), 
-            transforms.RandomHorizontalFlip(p=0.5), # Flip 50% of time
+            transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             transforms.GaussianBlur(3),
         ])
@@ -74,7 +91,6 @@ class BalancedDataset(Dataset):
                     elif 'obs' in arr: obs = arr['obs']
                     else: continue
                     
-                    # Auto-Resize protection
                     if obs.shape[1] != 64:
                         obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
                         
@@ -86,15 +102,11 @@ class BalancedDataset(Dataset):
 
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
-        # Float conversion happens here to save RAM
         img = torch.from_numpy(self.data[idx]).float() / 255.0
         return self.transform(img), self.transform(img)
 
 # --- Training Loop ---
 def train():
-    print(f"🚀 Training Encoder on {DEVICE}")
-    
-    # Initialize Dataset
     try:
         dataset = BalancedDataset()
     except MemoryError:
@@ -118,7 +130,7 @@ def train():
         checkpoint = torch.load(path, map_location=DEVICE)
         encoder.load_state_dict(checkpoint)
     else:
-        print("--- STARTING FRESH (No previous encoder found) ---")
+        print("--- STARTING FRESH ---")
 
     os.makedirs("models", exist_ok=True)
 
@@ -144,14 +156,11 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Save checkpoint
         if (epoch+1) % 5 == 0:
             torch.save(encoder.state_dict(), f"models/encoder_mixed_ep{epoch+1}.pth")
 
-    # Save Final
     torch.save(encoder.state_dict(), "models/encoder_mixed_final.pth")
     print("\n✅ Encoder Training Complete.")
-    print("The model now understands both 'Exploration' (Physics) and 'Racing' (Task) features.")
 
 if __name__ == "__main__":
     train()
