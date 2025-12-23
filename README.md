@@ -58,7 +58,7 @@ python train_decoder_parallel.py
 ```
 heres an example, though features are still sharpening up: 
 
-<img src="data/reconstruct_ep43.png" width="800" alt="Reconstruction Epoch 43">
+<img src="reconstruct_ep43.png" width="800" alt="Reconstruction Epoch 43">
 
 note: this is a test of the encoder, is it sucessfully extracting features and embedding them into a vector that can be reconstructed - as these vectors wll be fed into our predictor later
 
