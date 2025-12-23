@@ -22,7 +22,7 @@ SEQUENCE_LEN = PRED_HORIZON + 1 # We need T to T+5
 ENCODER_PATH = "./models/encoder_mixed_ep5.pth" 
 if not os.path.exists(ENCODER_PATH): 
     # Fallback to whatever you have locally
-    ENCODER_PATH = "./models/encoder_final_mixed.pth"
+    ENCODER_PATH = "./models/encoder_mixed_final.pth"
 
 class MultiStepDataset(Dataset):
     def __init__(self):
