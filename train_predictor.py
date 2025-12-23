@@ -10,7 +10,7 @@ from tqdm import tqdm
 from networks import TinyEncoder, Predictor
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 128    # Lowered slightly because sequences take more VRAM
+BATCH_SIZE = 128    
 EPOCHS = 30
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -19,10 +19,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PRED_HORIZON = 5    # Predict 5 steps into the future (0.5s of physics)
 SEQUENCE_LEN = PRED_HORIZON + 1 # We need T to T+5
 
-ENCODER_PATH = "./models/encoder_mixed_ep5.pth" 
-if not os.path.exists(ENCODER_PATH): 
-    # Fallback to whatever you have locally
-    ENCODER_PATH = "./models/encoder_mixed_final.pth"
+# --- UPDATED PATH ---
+# We prioritize the final epoch you just finished
+ENCODER_PATH = "./models/encoder_mixed_final.pth" 
+
+if not os.path.exists(ENCODER_PATH):
+    print(f"⚠️ Warning: Could not find {ENCODER_PATH}. checking for alternatives...")
+    if os.path.exists("./models/encoder_mixed_final.pth"):
+        ENCODER_PATH = "./models/encoder_mixed_final.pth"
+    else:
+        # Fallback to the last autosave just in case
+        ENCODER_PATH = "./models/encoder_mixed_ep25.pth"
+    
+print(f"🎯 Target Encoder: {ENCODER_PATH}")
 
 class MultiStepDataset(Dataset):
     def __init__(self):
