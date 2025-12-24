@@ -76,7 +76,7 @@ def train():
     dataset = DiscriminatorDataset()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     
-    print("🚀 Training Energy-Based Cost Model...")
+    print("Training Energy-Based Cost Model...")
     for epoch in range(EPOCHS):
         cost_model.train()
         total_loss = 0
@@ -101,7 +101,7 @@ def train():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             
     torch.save(cost_model.state_dict(), "./models/cost_model_final.pth")
-    print("✅ Cost Model Saved.")
+    print("Cost Model Saved.")
 
 if __name__ == "__main__":
     train()
