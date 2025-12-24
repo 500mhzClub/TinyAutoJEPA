@@ -9,9 +9,9 @@ Unlike standard Imitation Learning, which clones human actions directly, this sy
 This project is configured for a high-performance AMD workstation running Linux. It utilizes a dual-GPU setup to parallelize feature learning (Encoder) and visual verification (Decoder).
 
 | Component | Specification | Function |
-| :--- | :--- | :--- |
+| --- | --- | --- |
 | **CPU** | **AMD Ryzen 9 5950X** (16C/32T) | Handles massive parallel data generation and loading. Runs 32 concurrent Gym environments during data collection and manages dataset shuffling for the 1.9M frame buffer. |
-| **GPU 1** | **AMD Radeon RX 6950 XT** (16GB) | Primary compute unit. Dedicated to training the **Encoder** and **Predictor**. Leverages ROCm mixed-precision (`torch.amp`) to handle large batch sizes (256) and VICReg loss calculations. |
+| **GPU 1** | **AMD Radeon RX 6950 XT** (16GB) | Primary compute unit. Dedicated to training the **Encoder**, **Predictor**, and **Cost Model**. Leverages ROCm mixed-precision (`torch.amp`) to handle large batch sizes (256) and VICReg loss calculations. |
 | **GPU 2** | **9060 XT** | Secondary compute unit. Runs the **Parallel Decoder** in the background. It dynamically loads checkpoints from GPU 1 to visualize the latent space in real time without pausing the main training loop. |
 | **RAM** | **64 GB DDR4** | Facilitates OS-level caching of the dataset, minimizing disk I/O latency during repeated training epochs. |
 | **OS** | **Pop!_OS (Linux)** | Selected for native ROCm kernel support and efficient thread scheduling. |
@@ -56,11 +56,12 @@ python train_decoder.py
 # Output: visuals/reconstruct_ep*.png
 
 ```
-heres an example, though features are still sharpening up: 
+
+Heres an example, though features are still sharpening up:
 
 <img src="reconstruct_ep43.png" width="800" alt="Reconstruction Epoch 43">
 
-note: this is a test of the encoder, is it sucessfully extracting features and embedding them into a vector that can be reconstructed - as these vectors wll be fed into our predictor later
+*Note: This is a test of the encoder to verify it is successfully extracting features and embedding them into a vector that can be reconstructed.*
 
 ### Step 4: Multi-Step Predictor Training
 
@@ -68,6 +69,16 @@ Trains the latent dynamics model. Unlike previous iterations, this uses a **Mult
 
 ```bash
 python train_predictor_multistep.py
+
+```
+
+### Step 5: Cost Model Training (The Judge)
+
+Trains the energy-based discriminator. This model learns to distinguish "Expert" behavior (Low Energy) from "Random" behavior (High Energy) in the latent space. It serves as the navigation compass for the MPC.
+
+```bash
+python train_cost_model.py
+# Output: models/cost_model_final.pth
 
 ```
 
@@ -101,13 +112,33 @@ The Decoder translates the internal numerical summaries back into visible images
 **Technical Detail:**
 The architecture is a **Transposed Convolutional Network** (Inverse ResNet). It projects the 512-dimensional latent vector into a 4x4 spatial feature map and progressively upsamples it to the original 64x64 resolution using learned convolutional filters.
 
-## Next Steps (Model Predictive Control)
+### 4. The Cost Model (`CostModel`)
 
-The current system is a passive observer. The next phase involves implementing Model Predictive Control (MPC) to enable active driving.
+**Layman Explanation:**
+The Cost Model functions as the system's subconscious "gut feeling." When the Predictor imagines a future where the car is on the grass, the Cost Model assigns it a "High Energy" (Bad) score. When it imagines a future on the racing line, it assigns a "Low Energy" (Good) score.
+
+**Technical Detail:**
+A lightweight MLP Classifier trained on the frozen latent embeddings. It outputs a scalar probability score , where  represents the "Expert" distribution and  represents the "Random/Chaos" distribution.
+
+## Energy-Based Autonomous Driving (MPC)
+
+The final phase implements **Model Predictive Control (MPC)** using an Energy-Based Model (EBM) approach. Instead of targeting a specific geometric point, the car minimizes "Energy" in the latent landscape.
+
+**Execution:**
+
+```bash
+python drive_mpc.py
+
+```
 
 **MPC Workflow:**
 
-1. **Simulation:** The model generates multiple random action sequences.
-2. **Prediction:** The Predictor estimates the future latent states for each sequence over the 5-step horizon.
-3. **Evaluation:** A cost function scores the predicted states in latent space (e.g., distance from the "center of track" latent cluster).
-4. **Execution:** The action sequence with the optimal score is executed.
+1. **Observation:** Encode the current camera frame into Latent State .
+2. **Dreaming:** Generate 1,000 parallel action sequences using **Colored Noise** (temporally correlated random smoothing) to ensure drivable trajectories.
+3. **Prediction:** The Predictor unrolls the future latent states () for all 1,000 futures simultaneously.
+4. **Judgment:** The Cost Model scores every predicted future state.
+* *Grass/Wall*  High Energy.
+* *Track/Racing Line*  Low Energy.
+
+
+5. **Action:** The system executes the first action of the sequence with the lowest cumulative energy.
