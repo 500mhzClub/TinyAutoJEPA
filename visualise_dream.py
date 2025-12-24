@@ -8,7 +8,7 @@ from networks import TinyEncoder, Predictor, TinyDecoder
 
 # --- Configuration ---
 NUM_DREAMS = 5         # How many videos to generate
-SEQ_LEN = 150          # How long to dream (150 frames = ~3 seconds)
+SEQ_LEN = 1500          # How long to dream (150 frames = ~3 seconds)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Model Paths
