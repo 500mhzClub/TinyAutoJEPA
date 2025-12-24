@@ -14,7 +14,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Model Paths
 ENCODER_PATH   = "./models/encoder_mixed_final.pth"
 PREDICTOR_PATH = "./models/predictor_multistep_final.pth"
-DECODER_PATH   = "./models/decoder_race_final.pth"   
+DECODER_PATH   = "./models/decoder_parallel_ep40.pth"   
 
 # Fallbacks
 if not os.path.exists(ENCODER_PATH): ENCODER_PATH = "./models/encoder_final_mixed.pth"
