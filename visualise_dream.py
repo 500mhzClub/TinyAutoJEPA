@@ -12,9 +12,9 @@ SEQ_LEN = 150          # How long to dream (150 frames = ~3 seconds)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Model Paths
-ENCODER_PATH   = "./models/encoder_final_mixed.pth"
-PREDICTOR_PATH = "./models/predictor_race_final.pth" 
-DECODER_PATH   = "./models/decoder_race_final.pth"     
+ENCODER_PATH   = "./models/encoder_mixed_final.pth"
+PREDICTOR_PATH = "./models/predictor_multistep_final.pth"
+DECODER_PATH   = "./models/decoder_race_final.pth"   
 
 # Fallbacks
 if not os.path.exists(ENCODER_PATH): ENCODER_PATH = "./models/encoder_final_mixed.pth"
