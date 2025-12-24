@@ -71,6 +71,9 @@ Trains the latent dynamics model. Unlike previous iterations, this uses a **Mult
 python train_predictor_multistep.py
 
 ```
+Initial Dream visualisation, predictor generating possible futures: 
+
+![Dream Visualization](output_dream.gif)
 
 ### Step 5: Cost Model Training (The Judge)
 

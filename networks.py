@@ -68,7 +68,6 @@ class TinyDecoder(nn.Module):
         x = x.view(-1, 256, 4, 4)
         return self.net(x)
     
-    # Add this to the bottom of networks.py
 class CostModel(nn.Module):
     def __init__(self, input_dim=512, hidden_dim=256):
         super().__init__()
@@ -85,3 +84,5 @@ class CostModel(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+    
+    
