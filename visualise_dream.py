@@ -8,7 +8,7 @@ from networks import TinyEncoder, Predictor, TinyDecoder
 
 # --- Configuration ---
 NUM_DREAMS = 5         
-SEQ_LEN = 200          # Longer dreams now possible!
+SEQ_LEN = 500          # Longer dreams now possible!
 GROUNDING_INTERVAL = 30 # Reset to reality every 30 frames (Disable with 9999)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
