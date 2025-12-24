@@ -67,3 +67,21 @@ class TinyDecoder(nn.Module):
         x = self.fc_input(z)
         x = x.view(-1, 256, 4, 4)
         return self.net(x)
+    
+    # Add this to the bottom of networks.py
+class CostModel(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid() # Output probability (0 to 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
