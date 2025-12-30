@@ -16,14 +16,13 @@ HORIZON = 10
 NUM_SAMPLES = 1000     
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# TUNING WEIGHTS
-ALPHA_ENERGY = 1.0     
-ALPHA_MAGNET = 0.5     
+# --- TUNING (REBALANCED) ---
+ALPHA_ENERGY = 5.0     # Multiplier for "Bad Texture" (Make this strong!)
+ALPHA_MAGNET = 0.05    # Multiplier for "Distance" (Keep this weak!)
 MOMENTUM     = 0.9     
 
 def load_models():
     print(f"🔌 Loading models on {DEVICE}...")
-    
     enc = TinyEncoder().to(DEVICE).eval()
     enc.load_state_dict(torch.load(MODEL_PATH_ENC, map_location=DEVICE))
     
@@ -33,12 +32,10 @@ def load_models():
     cost = CostModel().to(DEVICE).eval()
     cost.load_state_dict(torch.load(MODEL_PATH_COST, map_location=DEVICE))
     
-    # LOAD THE MAGNET INSTANTLY
     if not os.path.exists(MODEL_PATH_MAGNET):
-        raise FileNotFoundError("Magnet file missing! Run make_magnet.py first.")
-        
+        raise FileNotFoundError("Magnet file missing! Run make_magnet_quick.py first.")
     magnet = torch.load(MODEL_PATH_MAGNET, map_location=DEVICE)
-    print("Magnet Loaded from disk.")
+    print("Magnet Loaded.")
     
     return enc, pred, cost, magnet
 
@@ -62,7 +59,7 @@ def generate_action_sequences(current_action, num_samples, horizon):
     return actions
 
 def mpc_policy(encoder, predictor, cost_model, target_z, current_frame, last_action):
-    # 1. Encode
+    # Encode
     img = cv2.resize(current_frame, (64, 64))
     t_img = torch.tensor(img).float().to(DEVICE).unsqueeze(0) / 255.0
     t_img = t_img.permute(0, 3, 1, 2)
@@ -70,48 +67,59 @@ def mpc_policy(encoder, predictor, cost_model, target_z, current_frame, last_act
     with torch.no_grad():
         z_curr = encoder(t_img)
         
-    # 2. Generate Actions
     action_seqs = generate_action_sequences(last_action, NUM_SAMPLES, HORIZON)
     
-    # 3. Predict & Score
     z_futures = z_curr.repeat(NUM_SAMPLES, 1) 
     total_cost = torch.zeros(NUM_SAMPLES, device=DEVICE)
+    
+    # Debug trackers
+    debug_energy = 0.0
+    debug_magnet = 0.0
     
     with torch.no_grad():
         for t in range(HORIZON):
             z_futures = predictor(z_futures, action_seqs[:, t, :])
             
-            energy_score = cost_model(z_futures).squeeze()
-            magnet_dist = torch.norm(z_futures - target_z, dim=1)
+            # 1. Energy (Discriminator) - Range 0.0 to 1.0
+            raw_energy = cost_model(z_futures).squeeze()
             
-            step_cost = (energy_score * ALPHA_ENERGY) + (magnet_dist * ALPHA_MAGNET)
+            # 2. Magnet (Distance) - Range 0.0 to ~30.0
+            raw_dist = torch.norm(z_futures - target_z, dim=1)
+            
+            # Weighted Cost
+            step_cost = (raw_energy * ALPHA_ENERGY) + (raw_dist * ALPHA_MAGNET)
             
             discount = 0.95 ** t
             total_cost += step_cost * discount
+            
+            # Capture stats for the BEST action (approximation for debug)
+            if t == 0:
+                debug_energy = torch.mean(raw_energy).item()
+                debug_magnet = torch.mean(raw_dist).item()
 
     best_idx = torch.argmin(total_cost)
-    return action_seqs[best_idx, 0, :].cpu().numpy(), total_cost[best_idx].item()
+    return action_seqs[best_idx, 0, :].cpu().numpy(), total_cost[best_idx].item(), debug_energy, debug_magnet
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
-    
-    # Load everything instantly
     encoder, predictor, cost_model, target_z = load_models()
     
     obs, _ = env.reset()
     last_action = np.array([0.0, 0.0, 0.0])
     
-    print("\n⚡ HYBRID JEPA AUTOPILOT ENGAGED. Press Ctrl+C to stop.")
+    print("\n⚡ REBALANCED JEPA AUTOPILOT ENGAGED.")
+    print("   (Aiming for Low Energy, Low Distance)")
     
     try:
         step = 0
         while True:
-            action, cost = mpc_policy(encoder, predictor, cost_model, target_z, obs, last_action)
+            action, cost, d_energy, d_magnet = mpc_policy(encoder, predictor, cost_model, target_z, obs, last_action)
             obs, _, done, trunc, _ = env.step(action)
             last_action = action
             
             if step % 10 == 0:
-                print(f"Step {step} | Steer: {action[0]:.2f} | Cost: {cost:.4f}")
+                # DEBUG PRINT: Shows exactly what the brain is thinking
+                print(f"Step {step} | Steer: {action[0]:.2f} | Total: {cost:.2f} (⚡ {d_energy:.2f} | 🧲 {d_magnet:.1f})")
             step += 1
             
             if done or trunc:
