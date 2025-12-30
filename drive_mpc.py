@@ -2,23 +2,19 @@ import gymnasium as gym
 import torch
 import numpy as np
 import cv2
+import glob
 import os
-from networks import TinyEncoder, Predictor, CostModel
+from networks import TinyEncoder, Predictor
 
 # --- CONFIGURATION ---
-MODEL_PATH_ENC    = "./models/encoder_mixed_final.pth"
-MODEL_PATH_PRED   = "./models/predictor_multistep_final.pth"
-MODEL_PATH_COST   = "./models/cost_model_final.pth"
+MODEL_PATH_ENC  = "./models/encoder_mixed_final.pth"
+MODEL_PATH_PRED = "./models/predictor_multistep_final.pth"
 
 # MPC SETTINGS
-HORIZON = 5            # Reduced from 10 to keep predictions sharp
-NUM_SAMPLES = 2000     # Increased samples to find "needle in haystack"
+HORIZON = 5            
+NUM_SAMPLES = 1000     
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# TUNING
-ALPHA_ENERGY = 1.0     # 100% Trust in Texture Safety
-ALPHA_MAGNET = 0.0     # Disabled (removes straight-line bias)
-MOMENTUM     = 0.8     # Balance between smoothness and reactivity
+MEMORY_SIZE = 2000     # How many expert frames to keep in RAM
 
 def load_models():
     print(f"Loading models on {DEVICE}...")
@@ -28,33 +24,48 @@ def load_models():
     pred = Predictor().to(DEVICE).eval()
     pred.load_state_dict(torch.load(MODEL_PATH_PRED, map_location=DEVICE))
     
-    cost = CostModel().to(DEVICE).eval()
-    cost.load_state_dict(torch.load(MODEL_PATH_COST, map_location=DEVICE))
-    
-    return enc, pred, cost
+    return enc, pred
 
-def generate_action_sequences(current_action, num_samples, horizon):
-    actions = torch.zeros(num_samples, horizon, 3, device=DEVICE)
-    curr_t = torch.tensor(current_action, device=DEVICE).repeat(num_samples, 1)
+def create_memory_bank(encoder):
+    """
+    Instead of one 'Average' magnet, we keep 2,000 diverse examples.
+    This allows the car to match 'Left Turn' memories when turning left.
+    """
+    print(f"Building Memory Bank ({MEMORY_SIZE} examples)...")
+    files = glob.glob("./data_race/*.npz")[:50]
     
-    for t in range(horizon):
-        # Increased variance (0.5) so it can imagine hard turns
-        noise_steer = torch.randn(num_samples, device=DEVICE) * 0.5 
-        noise_gas   = torch.rand(num_samples, device=DEVICE) * 0.3 + 0.4 
-        
-        if t == 0:
-            steer = (MOMENTUM * curr_t[:, 0]) + ((1-MOMENTUM) * noise_steer)
-        else:
-            steer = (MOMENTUM * actions[:, t-1, 0]) + ((1-MOMENTUM) * noise_steer)
+    bank = []
+    with torch.no_grad():
+        for f in files:
+            if len(bank) >= MEMORY_SIZE: break
+            try:
+                data = np.load(f)
+                if 'states' in data: imgs = data['states']
+                elif 'obs' in data: imgs = data['obs']
+                else: continue
+                
+                # Take random samples from this file
+                indices = np.random.choice(len(imgs), size=min(100, len(imgs)), replace=False)
+                batch = imgs[indices]
+                
+                # Resize & Encode
+                if batch.shape[1] != 64:
+                    batch = np.array([cv2.resize(img, (64,64)) for img in batch])
+                    
+                tensor = torch.tensor(batch).float().to(DEVICE) / 255.0
+                tensor = tensor.permute(0, 3, 1, 2)
+                
+                z = encoder(tensor)
+                bank.append(z)
+            except: pass
             
-        actions[:, t, 0] = torch.clamp(steer, -1.0, 1.0)
-        actions[:, t, 1] = torch.clamp(noise_gas, 0.0, 1.0)
-        actions[:, t, 2] = 0.0 
-        
-    return actions
+    # [MEMORY_SIZE, 512]
+    memory_bank = torch.cat(bank, dim=0)[:MEMORY_SIZE]
+    print(f"Memory Bank Assembled. Shape: {memory_bank.shape}")
+    return memory_bank
 
-def mpc_policy(encoder, predictor, cost_model, current_frame, last_action):
-    # Encode
+def mpc_policy(encoder, predictor, memory_bank, current_frame):
+    # 1. Encode Current Reality
     img = cv2.resize(current_frame, (64, 64))
     t_img = torch.tensor(img).float().to(DEVICE).unsqueeze(0) / 255.0
     t_img = t_img.permute(0, 3, 1, 2)
@@ -62,8 +73,14 @@ def mpc_policy(encoder, predictor, cost_model, current_frame, last_action):
     with torch.no_grad():
         z_curr = encoder(t_img)
         
-    action_seqs = generate_action_sequences(last_action, NUM_SAMPLES, HORIZON)
+    # 2. Generate Action Candidates
+    # Simple random shooting often works best for short horizons
+    action_seqs = torch.rand(NUM_SAMPLES, HORIZON, 3, device=DEVICE)
+    action_seqs[:, :, 0] = (action_seqs[:, :, 0] * 2) - 1 # Steer -1 to 1
+    action_seqs[:, :, 1] = (action_seqs[:, :, 1] * 0.5) + 0.5 # Gas 0.5 to 1.0
+    action_seqs[:, :, 2] = 0.0 # No Brake
     
+    # 3. Simulate Futures
     z_futures = z_curr.repeat(NUM_SAMPLES, 1) 
     total_cost = torch.zeros(NUM_SAMPLES, device=DEVICE)
     
@@ -71,46 +88,56 @@ def mpc_policy(encoder, predictor, cost_model, current_frame, last_action):
         for t in range(HORIZON):
             z_futures = predictor(z_futures, action_seqs[:, t, :])
             
-            # Cost is purely based on "Does this look like expert driving?"
-            # We ignore the Magnet to prevent corner-cutting
-            step_cost = cost_model(z_futures).squeeze()
+            # --- NEAREST NEIGHBOR COST ---
+            # Instead of distance to Mean, find distance to CLOSEST memory
+            # We use CDIST (pairwise distance)
+            # z_futures: [1000, 512]
+            # memory_bank: [2000, 512]
             
-            discount = 0.90 ** t
-            total_cost += step_cost * discount
+            # This computes distance from every future to every memory
+            dists = torch.cdist(z_futures, memory_bank) # [1000, 2000]
+            
+            # Find the single closest expert memory for each future
+            min_dist, _ = torch.min(dists, dim=1) # [1000]
+            
+            total_cost += min_dist
 
+    # 4. Pick Best
     best_idx = torch.argmin(total_cost)
-    best_cost = total_cost[best_idx].item()
-    return action_seqs[best_idx, 0, :].cpu().numpy(), best_cost
+    best_action = action_seqs[best_idx, 0, :].cpu().numpy()
+    min_cost = total_cost[best_idx].item()
+    
+    return best_action, min_cost
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
-    encoder, predictor, cost_model = load_models()
+    encoder, predictor = load_models()
+    
+    # Create the Brain Bank
+    memory_bank = create_memory_bank(encoder)
     
     obs, _ = env.reset()
-    last_action = np.array([0.0, 0.0, 0.0])
     
-    print("MPC ENGAGED (Horizon=5, Texture Only)")
+    print("\nMEMORY-BANK AUTOPILOT ENGAGED.")
     
     try:
         step = 0
         while True:
-            action, cost = mpc_policy(encoder, predictor, cost_model, obs, last_action)
+            action, cost = mpc_policy(encoder, predictor, memory_bank, obs)
+            
             obs, _, done, trunc, _ = env.step(action)
-            last_action = action
             
             if step % 10 == 0:
-                # If Cost is < 1.0, the car feels safe.
-                # If Cost is > 3.0, the car is panicking.
-                print(f"Step {step} | Steer: {action[0]:.2f} | Risk: {cost:.2f}")
+                print(f"Step {step} | Steer: {action[0]:.2f} | Dist: {cost:.2f}")
             step += 1
             
             if done or trunc:
-                print("Resetting...")
+                print("Crash/Reset")
                 obs, _ = env.reset()
-                last_action = np.array([0.0, 0.0, 0.0])
                 step = 0
                 
     except KeyboardInterrupt:
+        print("Stopping...")
         env.close()
 
 if __name__ == "__main__":
