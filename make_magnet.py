@@ -3,19 +3,18 @@ import numpy as np
 import cv2
 import glob
 import os
-from tqdm import tqdm
 from networks import TinyEncoder
-import time
 import gc
+from tqdm import tqdm
 
 # --- CONFIG ---
 MODEL_PATH_ENC = "./models/encoder_mixed_final.pth"
 SAVE_PATH      = "./models/expert_magnet.pth"
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE     = 128  # Safe batch size
+BATCH_SIZE     = 128 
 
 def main():
-    # 1. Force Clean Start
+    # Force clean start
     gc.collect()
     torch.cuda.empty_cache()
     
@@ -26,7 +25,8 @@ def main():
     encoder.load_state_dict(torch.load(MODEL_PATH_ENC, map_location=DEVICE))
 
     print("Calibrating Magnet from Race Data...")
-    files = glob.glob("./data_race/*.npz")[:50] # Process up to 50 files
+    # Limit to 32 files to keep it quick
+    files = glob.glob("./data_race/*.npz")[:32]
     
     latents = []
     total_frames = 0
@@ -49,28 +49,30 @@ def main():
             if batch_cpu.shape[1] != 64:
                 batch_cpu = np.array([cv2.resize(img, (64,64)) for img in batch_cpu])
 
-            # Encode (GPU Batching)
             num_samples = len(batch_cpu)
             
-            # Print status every file
-            print(f"[{file_idx+1}/{len(files)}] {filename}: Encoding {num_samples} frames...", end="", flush=True)
+            # INNER LOOP PROGRESS BAR
+            # This will show you exactly how fast the GPU is crunching
+            print(f"[{file_idx+1}/{len(files)}] {filename}:")
             
             with torch.no_grad():
-                for i in range(0, num_samples, BATCH_SIZE):
-                    chunk_cpu = batch_cpu[i : i + BATCH_SIZE]
-                    
-                    # To GPU
-                    chunk_tensor = torch.tensor(chunk_cpu).float() / 255.0
-                    chunk_tensor = chunk_tensor.permute(0, 3, 1, 2).to(DEVICE)
-                    
-                    # Encode
-                    z = encoder(chunk_tensor)
-                    latents.append(z.cpu()) # Move to CPU immediately
+                with tqdm(total=num_samples, unit="frames", leave=False) as pbar:
+                    for i in range(0, num_samples, BATCH_SIZE):
+                        chunk_cpu = batch_cpu[i : i + BATCH_SIZE]
+                        
+                        # To GPU
+                        chunk_tensor = torch.tensor(chunk_cpu).float() / 255.0
+                        chunk_tensor = chunk_tensor.permute(0, 3, 1, 2).to(DEVICE)
+                        
+                        # Encode
+                        z = encoder(chunk_tensor)
+                        latents.append(z.cpu())
+                        
+                        pbar.update(len(chunk_cpu))
             
-            print(" Done.")
             total_frames += num_samples
             
-            # Aggressive Cleanup
+            # Cleanup
             del batch_cpu
             del chunk_tensor
             del z
