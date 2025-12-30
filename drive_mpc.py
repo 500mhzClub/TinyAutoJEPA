@@ -17,9 +17,9 @@ NUM_SAMPLES = 1000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- TUNING (REBALANCED) ---
-ALPHA_ENERGY = 5.0     # Multiplier for "Bad Texture" (Make this strong!)
-ALPHA_MAGNET = 0.05    # Multiplier for "Distance" (Keep this weak!)
-MOMENTUM     = 0.9     
+ALPHA_ENERGY = 0.0    
+ALPHA_MAGNET = 1.0    
+MOMENTUM     = 0.7     
 
 def load_models():
     print(f"🔌 Loading models on {DEVICE}...")
