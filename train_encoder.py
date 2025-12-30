@@ -15,65 +15,38 @@ BATCH_SIZE = 256
 EPOCHS = 30
 LR = 1e-4    
 
-# --- Hardware Check ---
 if torch.cuda.is_available():
-    DEVICE = torch.device("cuda:0") # Force default GPU
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    print(f"\n🖥️  HARDWARE ACCELERATION ENABLED")
-    print(f"   --------------------------------")
-    print(f"   Active GPU:  {gpu_name}")
-    print(f"   VRAM Buffer: {gpu_mem:.2f} GB")
-    print(f"   Device ID:   {DEVICE}")
-    print(f"   --------------------------------\n")
+    DEVICE = torch.device("cuda:0") 
 else:
     DEVICE = torch.device("cpu")
-    print("\n⚠️  WARNING: No GPU detected. Training will be extremely slow.\n")
 
-# --- Balanced Dataset ---
 class BalancedDataset(Dataset):
     def __init__(self):
-        print("--- ⚖️  Constructing Balanced Dataset ---")
+        print("--- Constructing High-Quality Dataset ---")
         
-        # 1. Load Datasets Separately
-        self.random_data = self.load_from_folder("./data/*.npz", "Random/Exploration")
-        self.race_data   = self.load_from_folder("./data_race/*.npz", "Expert/Race")
+        # 1. Load Expert and Recovery Data
+        # WE INTENTIONALLY IGNORE THE RANDOM 'data' FOLDER NOW
+        self.race_data     = self.load_from_folder("./data_race/*.npz", "Expert/Race")
+        self.recovery_data = self.load_from_folder("./data_recovery/*.npz", "Recovery/Drift")
         
-        # 2. Calculate the Bottleneck
-        n_random = len(self.random_data)
-        n_race = len(self.race_data)
-        min_len = min(n_random, n_race)
+        # 2. Combine
+        if len(self.race_data) == 0 or len(self.recovery_data) == 0:
+            print("Warning: Missing data! Ensure you ran collect_race_data and collect_recovery_data.")
         
-        print(f"\n📊 Balancing Strategy:")
-        print(f"   - Random Frames: {n_random:,}")
-        print(f"   - Race Frames:   {n_race:,}")
+        self.data = np.concatenate([self.race_data, self.recovery_data], axis=0)
         
-        if min_len == 0:
-            raise ValueError("❌ One of the datasets is empty! Check your folders.")
-
-        print(f"   - Target Count:  {min_len:,} per group (50/50 split)")
-        
-        # 3. Undersample the Majority Class
-        idx_random = np.random.choice(n_random, min_len, replace=False)
-        idx_race   = np.random.choice(n_race, min_len, replace=False)
-        
-        balanced_random = self.random_data[idx_random]
-        balanced_race   = self.race_data[idx_race]
-        
-        # 4. Merge
-        self.data = np.concatenate([balanced_random, balanced_race], axis=0)
-        
-        # Free up memory immediately
-        del self.random_data
+        # Free memory
         del self.race_data
+        del self.recovery_data
         
         # NHWC -> NCHW
         self.data = np.transpose(self.data, (0, 3, 1, 2)) 
-        print(f"✅ Final Dataset Size: {len(self.data):,} frames")
+        print(f"Final Dataset Size: {len(self.data):,} frames")
 
-        # 5. Augmentations
+        # 3. Augmentations (FIXED CROP)
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(64, scale=(0.7, 1.0)), 
+            # Scale changed from 0.7 -> 0.9 to prevent losing context (zoomed in grass)
+            transforms.RandomResizedCrop(64, scale=(0.9, 1.0)), 
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             transforms.GaussianBlur(3),
@@ -105,12 +78,11 @@ class BalancedDataset(Dataset):
         img = torch.from_numpy(self.data[idx]).float() / 255.0
         return self.transform(img), self.transform(img)
 
-# --- Training Loop ---
 def train():
     try:
         dataset = BalancedDataset()
     except MemoryError:
-        print("!!! OOM Error: Dataset too large for RAM. Reduce 'min_len' manually or add swap.")
+        print("OOM Error: Dataset too large for RAM.")
         return
 
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
@@ -119,18 +91,6 @@ def train():
     projector = Projector().to(DEVICE)
     optimizer = optim.Adam(list(encoder.parameters()) + list(projector.parameters()), lr=LR)
     scaler = torch.amp.GradScaler('cuda')
-
-    # --- Resume Logic ---
-    path = None
-    if os.path.exists("./models/encoder_mixed_final.pth"): path = "./models/encoder_mixed_final.pth"
-    elif os.path.exists("./models/encoder_final.pth"): path = "./models/encoder_final.pth"
-
-    if path:
-        print(f"--- RESUMING from {path} ---")
-        checkpoint = torch.load(path, map_location=DEVICE)
-        encoder.load_state_dict(checkpoint)
-    else:
-        print("--- STARTING FRESH ---")
 
     os.makedirs("models", exist_ok=True)
 
@@ -160,7 +120,7 @@ def train():
             torch.save(encoder.state_dict(), f"models/encoder_mixed_ep{epoch+1}.pth")
 
     torch.save(encoder.state_dict(), "models/encoder_mixed_final.pth")
-    print("\n✅ Encoder Training Complete.")
+    print("Encoder Training Complete.")
 
 if __name__ == "__main__":
     train()
