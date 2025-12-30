@@ -9,20 +9,19 @@ from networks import TinyEncoder, Predictor, CostModel
 MODEL_PATH_ENC    = "./models/encoder_mixed_final.pth"
 MODEL_PATH_PRED   = "./models/predictor_multistep_final.pth"
 MODEL_PATH_COST   = "./models/cost_model_final.pth"
-MODEL_PATH_MAGNET = "./models/expert_magnet.pth"
 
-# HYBRID CONTROL SETTINGS
-HORIZON = 10           
-NUM_SAMPLES = 1000     
+# MPC SETTINGS
+HORIZON = 5            # Reduced from 10 to keep predictions sharp
+NUM_SAMPLES = 2000     # Increased samples to find "needle in haystack"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- TUNING (REBALANCED) ---
-ALPHA_ENERGY = 0.0    
-ALPHA_MAGNET = 1.0    
-MOMENTUM     = 0.7     
+# TUNING
+ALPHA_ENERGY = 1.0     # 100% Trust in Texture Safety
+ALPHA_MAGNET = 0.0     # Disabled (removes straight-line bias)
+MOMENTUM     = 0.8     # Balance between smoothness and reactivity
 
 def load_models():
-    print(f"🔌 Loading models on {DEVICE}...")
+    print(f"Loading models on {DEVICE}...")
     enc = TinyEncoder().to(DEVICE).eval()
     enc.load_state_dict(torch.load(MODEL_PATH_ENC, map_location=DEVICE))
     
@@ -32,19 +31,15 @@ def load_models():
     cost = CostModel().to(DEVICE).eval()
     cost.load_state_dict(torch.load(MODEL_PATH_COST, map_location=DEVICE))
     
-    if not os.path.exists(MODEL_PATH_MAGNET):
-        raise FileNotFoundError("Magnet file missing! Run make_magnet_quick.py first.")
-    magnet = torch.load(MODEL_PATH_MAGNET, map_location=DEVICE)
-    print("Magnet Loaded.")
-    
-    return enc, pred, cost, magnet
+    return enc, pred, cost
 
 def generate_action_sequences(current_action, num_samples, horizon):
     actions = torch.zeros(num_samples, horizon, 3, device=DEVICE)
     curr_t = torch.tensor(current_action, device=DEVICE).repeat(num_samples, 1)
     
     for t in range(horizon):
-        noise_steer = torch.randn(num_samples, device=DEVICE) * 0.2 
+        # Increased variance (0.5) so it can imagine hard turns
+        noise_steer = torch.randn(num_samples, device=DEVICE) * 0.5 
         noise_gas   = torch.rand(num_samples, device=DEVICE) * 0.3 + 0.4 
         
         if t == 0:
@@ -58,7 +53,7 @@ def generate_action_sequences(current_action, num_samples, horizon):
         
     return actions
 
-def mpc_policy(encoder, predictor, cost_model, target_z, current_frame, last_action):
+def mpc_policy(encoder, predictor, cost_model, current_frame, last_action):
     # Encode
     img = cv2.resize(current_frame, (64, 64))
     t_img = torch.tensor(img).float().to(DEVICE).unsqueeze(0) / 255.0
@@ -72,64 +67,50 @@ def mpc_policy(encoder, predictor, cost_model, target_z, current_frame, last_act
     z_futures = z_curr.repeat(NUM_SAMPLES, 1) 
     total_cost = torch.zeros(NUM_SAMPLES, device=DEVICE)
     
-    # Debug trackers
-    debug_energy = 0.0
-    debug_magnet = 0.0
-    
     with torch.no_grad():
         for t in range(HORIZON):
             z_futures = predictor(z_futures, action_seqs[:, t, :])
             
-            # 1. Energy (Discriminator) - Range 0.0 to 1.0
-            raw_energy = cost_model(z_futures).squeeze()
+            # Cost is purely based on "Does this look like expert driving?"
+            # We ignore the Magnet to prevent corner-cutting
+            step_cost = cost_model(z_futures).squeeze()
             
-            # 2. Magnet (Distance) - Range 0.0 to ~30.0
-            raw_dist = torch.norm(z_futures - target_z, dim=1)
-            
-            # Weighted Cost
-            step_cost = (raw_energy * ALPHA_ENERGY) + (raw_dist * ALPHA_MAGNET)
-            
-            discount = 0.95 ** t
+            discount = 0.90 ** t
             total_cost += step_cost * discount
-            
-            # Capture stats for the BEST action (approximation for debug)
-            if t == 0:
-                debug_energy = torch.mean(raw_energy).item()
-                debug_magnet = torch.mean(raw_dist).item()
 
     best_idx = torch.argmin(total_cost)
-    return action_seqs[best_idx, 0, :].cpu().numpy(), total_cost[best_idx].item(), debug_energy, debug_magnet
+    best_cost = total_cost[best_idx].item()
+    return action_seqs[best_idx, 0, :].cpu().numpy(), best_cost
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
-    encoder, predictor, cost_model, target_z = load_models()
+    encoder, predictor, cost_model = load_models()
     
     obs, _ = env.reset()
     last_action = np.array([0.0, 0.0, 0.0])
     
-    print("\n⚡ REBALANCED JEPA AUTOPILOT ENGAGED.")
-    print("   (Aiming for Low Energy, Low Distance)")
+    print("MPC ENGAGED (Horizon=5, Texture Only)")
     
     try:
         step = 0
         while True:
-            action, cost, d_energy, d_magnet = mpc_policy(encoder, predictor, cost_model, target_z, obs, last_action)
+            action, cost = mpc_policy(encoder, predictor, cost_model, obs, last_action)
             obs, _, done, trunc, _ = env.step(action)
             last_action = action
             
             if step % 10 == 0:
-                # DEBUG PRINT: Shows exactly what the brain is thinking
-                print(f"Step {step} | Steer: {action[0]:.2f} | Total: {cost:.2f} (⚡ {d_energy:.2f} | 🧲 {d_magnet:.1f})")
+                # If Cost is < 1.0, the car feels safe.
+                # If Cost is > 3.0, the car is panicking.
+                print(f"Step {step} | Steer: {action[0]:.2f} | Risk: {cost:.2f}")
             step += 1
             
             if done or trunc:
-                print("Crash/Reset")
+                print("Resetting...")
                 obs, _ = env.reset()
                 last_action = np.array([0.0, 0.0, 0.0])
                 step = 0
                 
     except KeyboardInterrupt:
-        print("Stopping...")
         env.close()
 
 if __name__ == "__main__":
