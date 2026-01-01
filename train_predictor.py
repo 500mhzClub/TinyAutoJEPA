@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
 import glob
 import os
@@ -10,30 +10,27 @@ import random
 from tqdm import tqdm
 from networks import TinyEncoder, Predictor
 
-# --- CONFIGURATION ---
-BATCH_SIZE = 64     
-EPOCHS = 40         
+# --- CONFIG ---
+BATCH_SIZE = 64
+EPOCHS = 40
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PRED_HORIZON = 15    
 SEQUENCE_LEN = PRED_HORIZON + 1 
-MAX_EPISODES = 600 # Safety limit for RAM
+STEPS_PER_EPOCH = 1000 # 1000 batches * 64 size = 64,000 samples per epoch
 
 ENCODER_PATH = "./models/encoder_mixed_final.pth" 
 
-class MultiStepDataset(Dataset):
+class StreamingSeqDataset(IterableDataset):
     def __init__(self):
-        all_files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
-        random.shuffle(all_files)
-        
-        # RAM Safety: Only take a subset of files
-        files_to_load = all_files[:MAX_EPISODES]
-        print(f"Loading Episodes from {len(files_to_load)} files (Subset of {len(all_files)})...")
-        
-        self.episodes = [] 
-        self.valid_indices = []
-        
-        for f in tqdm(files_to_load, desc="Indexing"):
+        self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
+        random.shuffle(self.files)
+        print(f"Streaming {len(self.files)} files...")
+
+    def __iter__(self):
+        while True:
+            # Pick random file
+            f = random.choice(self.files)
             try:
                 with np.load(f) as arr:
                     if 'states' in arr: o, a = arr['states'], arr['actions']
@@ -47,39 +44,24 @@ class MultiStepDataset(Dataset):
 
                     o = np.transpose(o, (0, 3, 1, 2))
                     
-                    self.episodes.append({'obs': o, 'act': a})
+                    # Yield sequences from this file
+                    # We can pick random start points to keep it fresh
+                    num_valid_starts = len(o) - SEQUENCE_LEN
                     
-                    ep_idx = len(self.episodes) - 1
-                    num_valid_starts = len(o) - SEQUENCE_LEN + 1
-                    for t in range(0, num_valid_starts, 2): 
-                        self.valid_indices.append((ep_idx, t))
+                    # Yield 50 random sequences from this file, then move to next file
+                    # This prevents IO bottleneck (opening file just for 1 sequence)
+                    for _ in range(50):
+                        start_t = random.randint(0, num_valid_starts)
+                        end_t = start_t + SEQUENCE_LEN
+                        
+                        obs_seq = torch.from_numpy(o[start_t:end_t]).float() / 255.0
+                        act_seq = torch.from_numpy(a[start_t:end_t-1]).float()
+                        yield obs_seq, act_seq
             except: pass
-            
-        print(f"Loaded {len(self.episodes)} episodes.")
-        print(f"Training Sequences: {len(self.valid_indices):,}")
-
-    def __len__(self): return len(self.valid_indices)
-
-    def __getitem__(self, idx):
-        ep_idx, start_t = self.valid_indices[idx]
-        data = self.episodes[ep_idx]
-        
-        end_t = start_t + SEQUENCE_LEN
-        
-        obs_seq = data['obs'][start_t : end_t]      
-        act_seq = data['act'][start_t : end_t - 1]  
-        
-        obs_seq = torch.from_numpy(obs_seq).float() / 255.0
-        act_seq = torch.from_numpy(act_seq).float()
-        
-        return obs_seq, act_seq
 
 def train():
-    print(f"Training Long-Horizon Predictor (Steps={PRED_HORIZON}) on {DEVICE}")
+    print(f"Training Streaming Predictor on {DEVICE}")
     
-    if not os.path.exists(ENCODER_PATH):
-        raise FileNotFoundError("Encoder not found! Run train_encoder.py first.")
-
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
@@ -90,17 +72,22 @@ def train():
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
-    dataset = MultiStepDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                            num_workers=4, pin_memory=True, drop_last=True)
+    dataset = StreamingSeqDataset()
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+    data_iter = iter(dataloader)
 
     for epoch in range(EPOCHS):
         predictor.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(range(STEPS_PER_EPOCH), desc=f"Epoch {epoch+1}/{EPOCHS}")
 
-        for obs_seq, act_seq in pbar:
+        for _ in pbar:
+            try:
+                obs_seq, act_seq = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                obs_seq, act_seq = next(data_iter)
+
             B, T_plus_1, C, H, W = obs_seq.shape
-            
             obs_flat = obs_seq.view(-1, C, H, W).to(DEVICE, non_blocking=True)
             act_seq = act_seq.to(DEVICE, non_blocking=True)
 
@@ -127,10 +114,8 @@ def train():
                         z_current = z_next_pred
 
             scaler.scale(loss).backward()
-            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm=1.0)
-            
             scaler.step(optimizer)
             scaler.update()
             
@@ -140,7 +125,7 @@ def train():
             torch.save(predictor.state_dict(), f"models/predictor_multistep_ep{epoch+1}.pth")
 
     torch.save(predictor.state_dict(), "models/predictor_multistep_final.pth")
-    print("Predictor Training Complete.")
+    print("Streaming Predictor Training Complete.")
 
 if __name__ == "__main__":
     train()
