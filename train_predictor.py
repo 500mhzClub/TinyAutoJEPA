@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 import numpy as np
 import glob
 import os
@@ -10,58 +10,93 @@ import random
 from tqdm import tqdm
 from networks import TinyEncoder, Predictor
 
-# --- CONFIG ---
-BATCH_SIZE = 64
-EPOCHS = 40
+# --- CONFIGURATION ---
+BATCH_SIZE = 64     
+EPOCHS = 40         
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PRED_HORIZON = 15    
 SEQUENCE_LEN = PRED_HORIZON + 1 
-STEPS_PER_EPOCH = 1000 # 1000 batches * 64 size = 64,000 samples per epoch
-
 ENCODER_PATH = "./models/encoder_mixed_final.pth" 
+NUM_WORKERS = 8
 
-class StreamingSeqDataset(IterableDataset):
+class ShardedSeqDataset(IterableDataset):
     def __init__(self):
         self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
         random.shuffle(self.files)
-        print(f"Streaming {len(self.files)} files...")
+        # Approx estimate
+        self.est_samples = (len(self.files) * 2000) 
+        print(f"--- 🚀 High-RAM Predictor Training ---")
+        print(f"    Targeting {len(self.files)} files.")
 
     def __iter__(self):
-        while True:
-            # Pick random file
-            f = random.choice(self.files)
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            my_files = self.files[worker_info.id::worker_info.num_workers]
+        else:
+            my_files = self.files
+        
+        random.shuffle(my_files)
+        
+        # Buffer to hold sequences in RAM
+        # A sequence is larger than a single frame, so we are careful.
+        # 4GB RAM / (16 frames * 12KB) = Plenty of room.
+        sequences_buffer = []
+        MAX_SEQS_PER_WORKER = 25_000 # Limit to prevent OOM
+        
+        # 1. LOAD PHASE
+        for f in my_files:
+            if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: break
             try:
-                with np.load(f) as arr:
-                    if 'states' in arr: o, a = arr['states'], arr['actions']
-                    elif 'obs' in arr: o, a = arr['obs'], arr['action']
+                with np.load(f) as data:
+                    if 'states' in data: 
+                        obs_raw = data['states']
+                        act_raw = data['actions']
+                    elif 'obs' in data: 
+                        obs_raw = data['obs']
+                        act_raw = data['action']
                     else: continue
-                    
-                    if len(o) < SEQUENCE_LEN: continue
+                
+                length = len(obs_raw)
+                if length < SEQUENCE_LEN: continue
 
-                    if o.shape[1] != 64:
-                        o = np.array([cv2.resize(img, (64, 64)) for img in o])
-
-                    o = np.transpose(o, (0, 3, 1, 2))
+                # Extract sequences immediately to save managing large raw arrays
+                valid_starts = range(0, length - SEQUENCE_LEN)
+                
+                for start_t in valid_starts:
+                    if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: break
                     
-                    # Yield sequences from this file
-                    # We can pick random start points to keep it fresh
-                    num_valid_starts = len(o) - SEQUENCE_LEN
+                    end_t = start_t + SEQUENCE_LEN
                     
-                    # Yield 50 random sequences from this file, then move to next file
-                    # This prevents IO bottleneck (opening file just for 1 sequence)
-                    for _ in range(50):
-                        start_t = random.randint(0, num_valid_starts)
-                        end_t = start_t + SEQUENCE_LEN
-                        
-                        obs_seq = torch.from_numpy(o[start_t:end_t]).float() / 255.0
-                        act_seq = torch.from_numpy(a[start_t:end_t-1]).float()
-                        yield obs_seq, act_seq
+                    o_chunk = obs_raw[start_t:end_t]
+                    a_chunk = act_raw[start_t:end_t-1]
+                    
+                    if o_chunk.shape[1] != 64:
+                         o_chunk = np.array([cv2.resize(img, (64, 64)) for img in o_chunk])
+                    
+                    sequences_buffer.append((o_chunk, a_chunk))
+                    
             except: pass
+            
+        # 2. STREAM PHASE
+        random.shuffle(sequences_buffer)
+        
+        for o_chunk, a_chunk in sequences_buffer:
+            obs_seq = torch.from_numpy(o_chunk).float() / 255.0
+            obs_seq = obs_seq.permute(0, 3, 1, 2) 
+            act_seq = torch.from_numpy(a_chunk).float()
+            
+            yield obs_seq, act_seq
+            
+    def __len__(self): return self.est_samples
 
 def train():
-    print(f"Training Streaming Predictor on {DEVICE}")
+    print(f"Training Predictor on {DEVICE}")
     
+    if not os.path.exists(ENCODER_PATH):
+        print("Wait for Encoder to finish first!")
+        return
+
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
@@ -72,24 +107,21 @@ def train():
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
-    dataset = StreamingSeqDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
-    data_iter = iter(dataloader)
+    dataset = ShardedSeqDataset()
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
+    
+    steps_per_epoch = dataset.est_samples // BATCH_SIZE
 
     for epoch in range(EPOCHS):
         predictor.train()
-        pbar = tqdm(range(STEPS_PER_EPOCH), desc=f"Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(dataloader, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
-        for _ in pbar:
-            try:
-                obs_seq, act_seq = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                obs_seq, act_seq = next(data_iter)
-
-            B, T_plus_1, C, H, W = obs_seq.shape
-            obs_flat = obs_seq.view(-1, C, H, W).to(DEVICE, non_blocking=True)
+        for obs_seq, act_seq in pbar:
+            obs_seq = obs_seq.to(DEVICE, non_blocking=True)
             act_seq = act_seq.to(DEVICE, non_blocking=True)
+            
+            B, T_plus_1, C, H, W = obs_seq.shape
+            obs_flat = obs_seq.view(-1, C, H, W)
 
             optimizer.zero_grad()
 
@@ -108,10 +140,8 @@ def train():
                     z_next_pred = predictor(z_current, action)
                     loss += criterion(z_next_pred, z_target)
                     
-                    if np.random.rand() < 0.1:
-                        z_current = z_target
-                    else:
-                        z_current = z_next_pred
+                    if np.random.rand() < 0.1: z_current = z_target
+                    else: z_current = z_next_pred
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -125,7 +155,7 @@ def train():
             torch.save(predictor.state_dict(), f"models/predictor_multistep_ep{epoch+1}.pth")
 
     torch.save(predictor.state_dict(), "models/predictor_multistep_final.pth")
-    print("Streaming Predictor Training Complete.")
+    print("Predictor Training Complete.")
 
 if __name__ == "__main__":
     train()
