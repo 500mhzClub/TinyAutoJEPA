@@ -16,7 +16,7 @@ from vicreg import vicreg_loss
 BATCH_SIZE = 128
 EPOCHS = 30
 LR = 1e-4    
-NUM_WORKERS = 8 # Optimized for your CPU
+NUM_WORKERS = 8 
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda:0") 
@@ -29,33 +29,30 @@ class ChunkedBalancedDataset(IterableDataset):
         self.race_files = glob.glob("./data_race/*.npz")
         self.rec_files  = glob.glob("./data_recovery/*.npz")
         
-        # 1. Balance the File Lists
-        # We want equal probability of seeing Race vs Recovery
-        # If we have 100 race and 20 recovery, we upsample recovery
+        # 1. Balance the File Lists (50/50 Mix)
         max_files = max(len(self.race_files), len(self.rec_files))
-        
-        # Simple balancing: create a master list that is 50/50
-        # We will cycle the smaller list to match the larger one
         self.balanced_files = []
         
-        # Interleave them: [Race, Rec, Race, Rec...]
-        # This ensures the model sees both even if the epoch cuts short
-        r_idx = 0
-        rec_idx = 0
-        
-        # Create enough pairs to cover all data at least once
-        total_pairs = max_files
-        
-        for _ in range(total_pairs):
+        r_idx, rec_idx = 0, 0
+        for _ in range(max_files):
             self.balanced_files.append(self.race_files[r_idx % len(self.race_files)])
             self.balanced_files.append(self.rec_files[rec_idx % len(self.rec_files)])
             r_idx += 1
             rec_idx += 1
             
-        print(f"Balanced File List: {len(self.balanced_files)} files (50/50 Mix)")
+        print(f"Balanced File List: {len(self.balanced_files)} files.")
         
-        # Estimate total frames (Assume ~2000 per file avg) for Progress Bar
-        self.est_total_frames = len(self.balanced_files) * 2000 
+        # 2. EXACT LENGTH SCAN (Fixes the progress bar)
+        print("Scanning headers for exact frame count...")
+        self.total_frames = 0
+        for f in tqdm(self.balanced_files):
+            try:
+                with np.load(f, mmap_mode='r') as d:
+                    if 'states' in d: self.total_frames += d['states'].shape[0]
+                    elif 'obs' in d: self.total_frames += d['obs'].shape[0]
+            except: pass
+            
+        print(f"✅ Exact Dataset Size: {self.total_frames:,} frames")
 
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(64, scale=(0.9, 1.0)), 
@@ -66,14 +63,11 @@ class ChunkedBalancedDataset(IterableDataset):
 
     def __iter__(self):
         worker_info = get_worker_info()
-        
-        # Distribute files among workers
         if worker_info is not None:
             my_files = self.balanced_files[worker_info.id::worker_info.num_workers]
         else:
             my_files = self.balanced_files
 
-        # Shuffle MY files so workers don't march in lockstep
         random.shuffle(my_files)
 
         for f in my_files:
@@ -88,29 +82,22 @@ class ChunkedBalancedDataset(IterableDataset):
                 if raw.shape[1] != 64:
                     raw = np.array([cv2.resize(img, (64, 64)) for img in raw])
 
-                # Shuffle frames INSIDE the file (Local Randomness)
                 indices = np.random.permutation(len(raw))
                 
                 for idx in indices:
                     img_raw = raw[idx]
-                    
-                    # To Tensor
                     img = torch.from_numpy(img_raw).float() / 255.0
-                    img = img.permute(2, 0, 1) # HWC -> CHW
+                    img = img.permute(2, 0, 1) 
                     if img.shape[0] != 3: img = img.permute(2, 0, 1)
 
                     yield self.transform(img), self.transform(img)
-
-            except Exception as e:
-                continue
+            except: continue
 
     def __len__(self):
-        return self.est_total_frames
+        return self.total_frames
 
 def train():
     dataset = ChunkedBalancedDataset()
-    
-    # Persistent workers keep the processes alive, avoiding startup overhead
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, 
                             pin_memory=True, prefetch_factor=2)
 
@@ -119,7 +106,6 @@ def train():
     optimizer = optim.Adam(list(encoder.parameters()) + list(projector.parameters()), lr=LR)
     scaler = torch.amp.GradScaler('cuda')
 
-    # Resume Logic
     start_epoch = 0
     checkpoints = glob.glob("./models/encoder_mixed_ep*.pth")
     if checkpoints:
@@ -135,8 +121,7 @@ def train():
     encoder.train()
     projector.train()
 
-    # Steps for tqdm
-    steps_per_epoch = dataset.est_total_frames // BATCH_SIZE
+    steps_per_epoch = dataset.total_frames // BATCH_SIZE
 
     for epoch in range(start_epoch, EPOCHS):
         total_loss = 0
