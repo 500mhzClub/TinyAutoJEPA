@@ -1,37 +1,53 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import numpy as np
 import glob
 import os
 import cv2 
-import random
+import re
 from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
-# --- CONFIGURATION ---
+# --- Configuration ---
 BATCH_SIZE = 128
 EPOCHS = 30
 LR = 1e-4    
-STEPS_PER_EPOCH = 2000 # Since we stream infinite data, we define an "Epoch" as 2000 batches
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda:0") 
 else:
     DEVICE = torch.device("cpu")
 
-class StreamingDataset(IterableDataset):
+class MmapDataset(Dataset):
     def __init__(self):
-        # We just list files. We DON'T load them yet.
-        self.race_files = glob.glob("./data_race/*.npz")
-        self.rec_files  = glob.glob("./data_recovery/*.npz")
+        print("--- Constructing Full Dataset (Memory Mapped) ---")
         
-        print(f"--- Streaming Dataset Initialized ---")
-        print(f"   Expert Files:   {len(self.race_files)}")
-        print(f"   Recovery Files: {len(self.rec_files)}")
+        # 1. Gather files
+        self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
         
+        # 2. Index files without loading them
+        # We need to know how many frames are in each file to map indices
+        self.file_indices = []
+        self.total_frames = 0
+        
+        print(f"Indexing {len(self.files)} files...")
+        for f in tqdm(self.files):
+            try:
+                # 'r' mode just reads the header, doesn't load data
+                with np.load(f, mmap_mode='r') as data:
+                    if 'states' in data: n = data['states'].shape[0]
+                    elif 'obs' in data: n = data['obs'].shape[0]
+                    else: continue
+                    
+                    self.file_indices.append((f, self.total_frames, n))
+                    self.total_frames += n
+            except: pass
+            
+        print(f"✅ Indexed {self.total_frames:,} frames across all files.")
+
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(64, scale=(0.9, 1.0)), 
             transforms.RandomHorizontalFlip(p=0.5),
@@ -39,51 +55,39 @@ class StreamingDataset(IterableDataset):
             transforms.GaussianBlur(3),
         ])
 
-    def load_random_file(self, file_list):
-        # Pick a random file and load it
-        if not file_list: return np.array([])
+    def __len__(self): return self.total_frames
+
+    def __getitem__(self, idx):
+        # Binary search or simple iteration to find which file owns this global idx
+        # (Iteration is fast enough since we only have ~60 files)
+        for fname, start_idx, count in self.file_indices:
+            if start_idx <= idx < start_idx + count:
+                local_idx = idx - start_idx
+                
+                # LAZY LOAD: Open file, grab one frame, close.
+                # mmap makes this instant.
+                try:
+                    with np.load(fname, mmap_mode='r') as data:
+                        if 'states' in data: raw = data['states'][local_idx]
+                        else: raw = data['obs'][local_idx]
+                        
+                        # Resize on the fly if needed
+                        if raw.shape[0] != 64: 
+                             raw = cv2.resize(raw, (64, 64))
+                        
+                        # Copy to ensure we own the memory (detached from mmap)
+                        img = torch.from_numpy(np.array(raw)).float() / 255.0
+                        return self.transform(img), self.transform(img)
+                except:
+                    # Fallback for corrupted frames (return black)
+                    return torch.zeros((3,64,64)), torch.zeros((3,64,64))
         
-        f = random.choice(file_list)
-        try:
-            with np.load(f) as arr:
-                if 'states' in arr: obs = arr['states']
-                elif 'obs' in arr: obs = arr['obs']
-                else: return np.array([])
-
-                # Auto-resize if needed
-                if obs.shape[1] != 64:
-                    obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
-                
-                # N H W C -> N C H W
-                obs = np.transpose(obs, (0, 3, 1, 2))
-                return obs
-        except:
-            return np.array([])
-
-    def __iter__(self):
-        # This runs inside every Worker Thread
-        while True:
-            # 50% chance to pick from Race, 50% from Recovery
-            if random.random() < 0.5:
-                data = self.load_random_file(self.race_files)
-            else:
-                data = self.load_random_file(self.rec_files)
-                
-            if len(data) == 0: continue
-            
-            # Shuffle the file's content
-            indices = np.random.permutation(len(data))
-            
-            # Yield frames one by one
-            for idx in indices:
-                img_float = torch.from_numpy(data[idx]).float() / 255.0
-                yield self.transform(img_float), self.transform(img_float)
+        return torch.zeros((3,64,64)), torch.zeros((3,64,64))
 
 def train():
-    # num_workers=4 means 4 background processes act as "DJ's", 
-    # constantly loading files and mixing them for the GPU.
-    dataset = StreamingDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+    # num_workers must be > 0 to hide disk latency
+    dataset = MmapDataset()
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
 
     encoder = TinyEncoder().to(DEVICE)
     projector = Projector().to(DEVICE)
@@ -92,33 +96,25 @@ def train():
 
     # Resume Logic
     start_epoch = 0
-    import re
     checkpoints = glob.glob("./models/encoder_mixed_ep*.pth")
     if checkpoints:
-        latest = max(checkpoints, key=lambda f: int(re.search(r'ep(\d+)', f).group(1)))
+        def get_epoch(f):
+            match = re.search(r'ep(\d+)', f)
+            return int(match.group(1)) if match else 0
+        latest = max(checkpoints, key=get_epoch)
         print(f"--- RESUMING from {latest} ---")
         encoder.load_state_dict(torch.load(latest, map_location=DEVICE))
-        start_epoch = int(re.search(r'ep(\d+)', latest).group(1))
+        start_epoch = get_epoch(latest)
 
     os.makedirs("models", exist_ok=True)
     encoder.train()
     projector.train()
 
-    # Training Loop
-    # Since dataset is infinite, we loop over the dataloader manually
-    data_iter = iter(dataloader)
-
     for epoch in range(start_epoch, EPOCHS):
         total_loss = 0
-        pbar = tqdm(range(STEPS_PER_EPOCH), desc=f"Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        for _ in pbar:
-            try:
-                x1, x2 = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader) # Reset if somehow exhausted
-                x1, x2 = next(data_iter)
-
+        for x1, x2 in pbar:
             x1, x2 = x1.to(DEVICE, non_blocking=True), x2.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
 
