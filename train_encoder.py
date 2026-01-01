@@ -6,14 +6,16 @@ import numpy as np
 import glob
 import os
 import cv2 
+import re
 from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
 # --- Configuration ---
-BATCH_SIZE = 256
+BATCH_SIZE = 128 # Reduced for stability
 EPOCHS = 30
 LR = 1e-4    
+MAX_RAM_FRAMES = 500_000 # Limit dataset to ~6GB RAM to prevent OOM
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda:0") 
@@ -22,40 +24,57 @@ else:
 
 class BalancedDataset(Dataset):
     def __init__(self):
-        print("--- Constructing High-Quality Dataset ---")
+        print("--- Constructing Balanced Dataset (RAM Safe) ---")
         
-        # 1. Load Expert and Recovery Data
-        # WE INTENTIONALLY IGNORE THE RANDOM 'data' FOLDER NOW
-        self.race_data     = self.load_from_folder("./data_race/*.npz", "Expert/Race")
-        self.recovery_data = self.load_from_folder("./data_recovery/*.npz", "Recovery/Drift")
+        # 1. Load File Lists
+        race_files = glob.glob("./data_race/*.npz")
+        recovery_files = glob.glob("./data_recovery/*.npz")
         
-        # 2. Combine
+        # 2. Estimate frames per file to limit loading
+        # Assume ~2000 frames per file on average
+        # We want MAX_RAM_FRAMES total, split 50/50
+        target_per_class = MAX_RAM_FRAMES // 2
+        files_needed_race = max(1, target_per_class // 2000)
+        files_needed_rec  = max(1, target_per_class // 1000)
+        
+        # Shuffle and Slice File Lists (Sampling files instead of frames saves loading time)
+        np.random.shuffle(race_files)
+        np.random.shuffle(recovery_files)
+        
+        race_files = race_files[:files_needed_race]
+        recovery_files = recovery_files[:files_needed_rec]
+        
+        print(f"Loading subset: {len(race_files)} Race files, {len(recovery_files)} Recovery files")
+
+        self.race_data     = self.load_from_folder(race_files, "Expert/Race")
+        self.recovery_data = self.load_from_folder(recovery_files, "Recovery/Drift")
+        
         if len(self.race_data) == 0 or len(self.recovery_data) == 0:
-            print("Warning: Missing data! Ensure you ran collect_race_data and collect_recovery_data.")
+            raise ValueError("Missing data! Ensure you ran data collection.")
+            
+        # 3. Balance perfectly
+        min_len = min(len(self.race_data), len(self.recovery_data))
+        print(f"Balancing to {min_len} frames per class...")
         
-        self.data = np.concatenate([self.race_data, self.recovery_data], axis=0)
+        idx_race = np.random.choice(len(self.race_data), min_len, replace=False)
+        idx_rec  = np.random.choice(len(self.recovery_data), min_len, replace=False)
         
-        # Free memory
+        self.data = np.concatenate([self.race_data[idx_race], self.recovery_data[idx_rec]], axis=0)
+        
         del self.race_data
         del self.recovery_data
         
-        # NHWC -> NCHW
         self.data = np.transpose(self.data, (0, 3, 1, 2)) 
-        print(f"Final Dataset Size: {len(self.data):,} frames")
+        print(f"✅ Final RAM Dataset: {len(self.data):,} frames")
 
-        # 3. Augmentations (FIXED CROP)
         self.transform = transforms.Compose([
-            # Scale changed from 0.7 -> 0.9 to prevent losing context (zoomed in grass)
             transforms.RandomResizedCrop(64, scale=(0.9, 1.0)), 
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             transforms.GaussianBlur(3),
         ])
 
-    def load_from_folder(self, glob_pattern, label):
-        files = glob.glob(glob_pattern)
-        print(f"Loading {label}: Found {len(files)} files...")
-        
+    def load_from_folder(self, files, label):
         data_list = []
         for f in tqdm(files, desc=f"Reading {label}"):
             try:
@@ -82,19 +101,40 @@ def train():
     try:
         dataset = BalancedDataset()
     except MemoryError:
-        print("OOM Error: Dataset too large for RAM.")
+        print("OOM Error: Still too large. Reduce MAX_RAM_FRAMES.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 
     encoder = TinyEncoder().to(DEVICE)
     projector = Projector().to(DEVICE)
     optimizer = optim.Adam(list(encoder.parameters()) + list(projector.parameters()), lr=LR)
     scaler = torch.amp.GradScaler('cuda')
 
+    # --- Robust Resume Logic ---
+    start_epoch = 0
+    
+    # Find all checkpoints
+    checkpoints = glob.glob("./models/encoder_mixed_ep*.pth")
+    
+    if checkpoints:
+        # Sort by epoch number
+        def get_epoch(f):
+            match = re.search(r'ep(\d+)', f)
+            return int(match.group(1)) if match else 0
+            
+        latest = max(checkpoints, key=get_epoch)
+        print(f"--- RESUMING from {latest} ---")
+        
+        checkpoint = torch.load(latest, map_location=DEVICE)
+        encoder.load_state_dict(checkpoint)
+        start_epoch = get_epoch(latest)
+    else:
+        print("--- STARTING FRESH ---")
+
     os.makedirs("models", exist_ok=True)
 
-    for epoch in range(EPOCHS):
+    for epoch in range(start_epoch, EPOCHS):
         encoder.train()
         projector.train()
         total_loss = 0
