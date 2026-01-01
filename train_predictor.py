@@ -6,6 +6,7 @@ import numpy as np
 import glob
 import os
 import cv2
+import random
 from tqdm import tqdm
 from networks import TinyEncoder, Predictor
 
@@ -14,23 +15,25 @@ BATCH_SIZE = 64
 EPOCHS = 40         
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- UPGRADE: LONG HORIZON TRAINING ---
 PRED_HORIZON = 15    
 SEQUENCE_LEN = PRED_HORIZON + 1 
+MAX_EPISODES = 600 # Safety limit for RAM
 
 ENCODER_PATH = "./models/encoder_mixed_final.pth" 
 
 class MultiStepDataset(Dataset):
     def __init__(self):
-        # Only load high quality data
-        self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
-        print(f"Loading Episodes from {len(self.files)} files...")
+        all_files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
+        random.shuffle(all_files)
+        
+        # RAM Safety: Only take a subset of files
+        files_to_load = all_files[:MAX_EPISODES]
+        print(f"Loading Episodes from {len(files_to_load)} files (Subset of {len(all_files)})...")
         
         self.episodes = [] 
         self.valid_indices = []
         
-        for f in tqdm(self.files, desc="Indexing"):
+        for f in tqdm(files_to_load, desc="Indexing"):
             try:
                 with np.load(f) as arr:
                     if 'states' in arr: o, a = arr['states'], arr['actions']
@@ -89,7 +92,7 @@ def train():
 
     dataset = MultiStepDataset()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                            num_workers=8, pin_memory=True, drop_last=True)
+                            num_workers=4, pin_memory=True, drop_last=True)
 
     for epoch in range(EPOCHS):
         predictor.train()
@@ -118,7 +121,6 @@ def train():
                     z_next_pred = predictor(z_current, action)
                     loss += criterion(z_next_pred, z_target)
                     
-                    # Drift Correction (10% Teacher Forcing)
                     if np.random.rand() < 0.1:
                         z_current = z_target
                     else:
