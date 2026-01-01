@@ -16,29 +16,46 @@ from vicreg import vicreg_loss
 BATCH_SIZE = 128
 EPOCHS = 30
 LR = 1e-4    
-
-# 64GB RAM OPTIMIZATION
-# We will use 8 workers. 
-# Total Data = ~32GB. 
-# Each worker will hold ~4GB in RAM.
-NUM_WORKERS = 8 
+NUM_WORKERS = 8 # Optimized for your CPU
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda:0") 
 else:
     DEVICE = torch.device("cpu")
 
-class ShardedMemoryDataset(IterableDataset):
+class ChunkedBalancedDataset(IterableDataset):
     def __init__(self):
-        self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
-        random.shuffle(self.files)
+        print("--- Constructing Chunked Dataset ---")
+        self.race_files = glob.glob("./data_race/*.npz")
+        self.rec_files  = glob.glob("./data_recovery/*.npz")
         
-        # Calculate total frames for the progress bar
-        # (We estimate based on average file size to avoid opening them all in the main process)
-        self.est_total_frames = len(self.files) * 2000 
-        print(f"--- 🚀 High-RAM Mode Enabled (64GB Detected) ---")
-        print(f"    Targeting {len(self.files)} files.")
-        print(f"    Estimated Data Size: ~32 GB")
+        # 1. Balance the File Lists
+        # We want equal probability of seeing Race vs Recovery
+        # If we have 100 race and 20 recovery, we upsample recovery
+        max_files = max(len(self.race_files), len(self.rec_files))
+        
+        # Simple balancing: create a master list that is 50/50
+        # We will cycle the smaller list to match the larger one
+        self.balanced_files = []
+        
+        # Interleave them: [Race, Rec, Race, Rec...]
+        # This ensures the model sees both even if the epoch cuts short
+        r_idx = 0
+        rec_idx = 0
+        
+        # Create enough pairs to cover all data at least once
+        total_pairs = max_files
+        
+        for _ in range(total_pairs):
+            self.balanced_files.append(self.race_files[r_idx % len(self.race_files)])
+            self.balanced_files.append(self.rec_files[rec_idx % len(self.rec_files)])
+            r_idx += 1
+            rec_idx += 1
+            
+        print(f"Balanced File List: {len(self.balanced_files)} files (50/50 Mix)")
+        
+        # Estimate total frames (Assume ~2000 per file avg) for Progress Bar
+        self.est_total_frames = len(self.balanced_files) * 2000 
 
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(64, scale=(0.9, 1.0)), 
@@ -48,80 +65,52 @@ class ShardedMemoryDataset(IterableDataset):
         ])
 
     def __iter__(self):
-        # --- WORKER ISOLATION LOGIC ---
-        # This code runs inside each worker process independently.
         worker_info = get_worker_info()
         
+        # Distribute files among workers
         if worker_info is not None:
-            # Divide files among workers
-            # Worker 0 gets files [0, 8, 16...]
-            # Worker 1 gets files [1, 9, 17...]
-            my_files = self.files[worker_info.id::worker_info.num_workers]
-            worker_id = worker_info.id
+            my_files = self.balanced_files[worker_info.id::worker_info.num_workers]
         else:
-            my_files = self.files
-            worker_id = 0
+            my_files = self.balanced_files
 
-        # --- MASSIVE CHUNK LOADING ---
-        # Load ALL assigned files into RAM as a single huge array.
-        # This takes ~30 seconds at startup but makes training blazing fast.
-        
-        data_buffer = []
-        
-        # Determine strict allocation limit per worker to prevent OOM
-        # 32GB Total / 8 Workers = 4GB per worker limit
-        # 4GB / (64*64*3 bytes) = ~325,000 frames per worker
-        MAX_FRAMES_PER_WORKER = 350_000 
-        
-        frames_loaded = 0
-        
+        # Shuffle MY files so workers don't march in lockstep
         random.shuffle(my_files)
-        
+
         for f in my_files:
-            if frames_loaded >= MAX_FRAMES_PER_WORKER: break
-            
             try:
+                # FAST LOAD: Load whole file into RAM
                 with np.load(f) as data:
                     if 'states' in data: raw = data['states']
                     elif 'obs' in data: raw = data['obs']
                     else: continue
                 
-                # Resize immediately to save RAM (if they aren't already 64x64)
+                # Resize if needed
                 if raw.shape[1] != 64:
                     raw = np.array([cv2.resize(img, (64, 64)) for img in raw])
+
+                # Shuffle frames INSIDE the file (Local Randomness)
+                indices = np.random.permutation(len(raw))
                 
-                data_buffer.append(raw)
-                frames_loaded += len(raw)
-            except: pass
-            
-        if len(data_buffer) > 0:
-            # Concatenate into one massive contiguous block in RAM
-            self.memory_chunk = np.concatenate(data_buffer, axis=0)
-            # Shuffle indices for randomness
-            self.indices = np.random.permutation(len(self.memory_chunk))
-            
-            # Streaming loop
-            for idx in self.indices:
-                img_raw = self.memory_chunk[idx]
-                
-                # To Tensor
-                img = torch.from_numpy(img_raw).float() / 255.0
-                img = img.permute(2, 0, 1) # HWC -> CHW
-                if img.shape[0] != 3: img = img.permute(2, 0, 1) # Fix double permute edge case
-                
-                yield self.transform(img), self.transform(img)
-        else:
-            # Fallback if file load failed
-            return
+                for idx in indices:
+                    img_raw = raw[idx]
+                    
+                    # To Tensor
+                    img = torch.from_numpy(img_raw).float() / 255.0
+                    img = img.permute(2, 0, 1) # HWC -> CHW
+                    if img.shape[0] != 3: img = img.permute(2, 0, 1)
+
+                    yield self.transform(img), self.transform(img)
+
+            except Exception as e:
+                continue
 
     def __len__(self):
         return self.est_total_frames
 
 def train():
-    dataset = ShardedMemoryDataset()
+    dataset = ChunkedBalancedDataset()
     
-    # PIN_MEMORY=True speeds up transfer to GPU
-    # PREFETCH_FACTOR=2 ensures the GPU never waits for data
+    # Persistent workers keep the processes alive, avoiding startup overhead
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, 
                             pin_memory=True, prefetch_factor=2)
 
@@ -146,13 +135,11 @@ def train():
     encoder.train()
     projector.train()
 
-    # Steps calculation (Approximate)
+    # Steps for tqdm
     steps_per_epoch = dataset.est_total_frames // BATCH_SIZE
 
     for epoch in range(start_epoch, EPOCHS):
         total_loss = 0
-        # We wrap the dataloader. The first time this runs, there will be a 
-        # ~30s delay while workers load their RAM chunks.
         pbar = tqdm(dataloader, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         for x1, x2 in pbar:
