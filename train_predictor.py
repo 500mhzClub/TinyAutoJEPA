@@ -24,10 +24,21 @@ class ShardedSeqDataset(IterableDataset):
     def __init__(self):
         self.files = glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz")
         random.shuffle(self.files)
-        # Approx estimate
-        self.est_samples = (len(self.files) * 2000) 
-        print(f"--- 🚀 High-RAM Predictor Training ---")
-        print(f"    Targeting {len(self.files)} files.")
+        
+        print(f"--- High-RAM Predictor Training ---")
+        print(f"Scanning headers for exact sequence count...")
+        
+        self.total_seqs = 0
+        for f in tqdm(self.files):
+            try:
+                with np.load(f, mmap_mode='r') as d:
+                    if 'states' in d: n = d['states'].shape[0]
+                    elif 'obs' in d: n = d['obs'].shape[0]
+                    if n > SEQUENCE_LEN:
+                        self.total_seqs += (n - SEQUENCE_LEN)
+            except: pass
+            
+        print(f"✅ Total Sequences: {self.total_seqs:,}")
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -36,13 +47,9 @@ class ShardedSeqDataset(IterableDataset):
         else:
             my_files = self.files
         
-        random.shuffle(my_files)
-        
         # Buffer to hold sequences in RAM
-        # A sequence is larger than a single frame, so we are careful.
-        # 4GB RAM / (16 frames * 12KB) = Plenty of room.
         sequences_buffer = []
-        MAX_SEQS_PER_WORKER = 25_000 # Limit to prevent OOM
+        MAX_SEQS_PER_WORKER = 30_000 
         
         # 1. LOAD PHASE
         for f in my_files:
@@ -60,12 +67,10 @@ class ShardedSeqDataset(IterableDataset):
                 length = len(obs_raw)
                 if length < SEQUENCE_LEN: continue
 
-                # Extract sequences immediately to save managing large raw arrays
                 valid_starts = range(0, length - SEQUENCE_LEN)
                 
                 for start_t in valid_starts:
                     if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: break
-                    
                     end_t = start_t + SEQUENCE_LEN
                     
                     o_chunk = obs_raw[start_t:end_t]
@@ -75,20 +80,17 @@ class ShardedSeqDataset(IterableDataset):
                          o_chunk = np.array([cv2.resize(img, (64, 64)) for img in o_chunk])
                     
                     sequences_buffer.append((o_chunk, a_chunk))
-                    
             except: pass
             
         # 2. STREAM PHASE
         random.shuffle(sequences_buffer)
-        
         for o_chunk, a_chunk in sequences_buffer:
             obs_seq = torch.from_numpy(o_chunk).float() / 255.0
             obs_seq = obs_seq.permute(0, 3, 1, 2) 
             act_seq = torch.from_numpy(a_chunk).float()
-            
             yield obs_seq, act_seq
             
-    def __len__(self): return self.est_samples
+    def __len__(self): return self.total_seqs
 
 def train():
     print(f"Training Predictor on {DEVICE}")
@@ -110,7 +112,10 @@ def train():
     dataset = ShardedSeqDataset()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     
-    steps_per_epoch = dataset.est_samples // BATCH_SIZE
+    # We use a smaller number for tqdm total if we rely on the RAM buffer limit
+    # because workers might drop data to save RAM.
+    # The iterator handles the actual end.
+    steps_per_epoch = len(dataset) // BATCH_SIZE
 
     for epoch in range(EPOCHS):
         predictor.train()
