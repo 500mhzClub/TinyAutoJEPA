@@ -6,7 +6,7 @@ import cv2
 import math
 import time
 
-NUM_WORKERS = min(32, mp.cpu_count())
+NUM_WORKERS = min(16, mp.cpu_count())
 EPISODES_PER_WORKER = 50
 MAX_STEPS = 1000
 DATA_DIR = "data_recovery"

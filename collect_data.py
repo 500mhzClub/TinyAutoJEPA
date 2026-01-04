@@ -6,7 +6,7 @@ import cv2
 import time
 
 # --- CONFIGURATION ---
-NUM_WORKERS = min(24, mp.cpu_count() - 2)
+NUM_WORKERS = min(16, mp.cpu_count() - 2)
 EPISODES_PER_WORKER = 80
 MAX_STEPS = 600
 DATA_DIR = "data"
