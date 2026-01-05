@@ -5,8 +5,48 @@ import glob
 import time
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
+# ----------------------------
+# ROCm/MIOpen: set stable defaults EARLY (before torch import)
+# ----------------------------
+
+def _mkdir_700(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p, 0o700)
+    except Exception:
+        pass
+
+# Optional convenience toggles:
+#   MIOPEN_CACHE_TAG=gpu1
+#   MIOPEN_STABLE=1
+#   MIOPEN_DISABLE_FIND_DB=1
+#   MIOPEN_FORCE_CONV_IMMED_FALLBACK=1
+if os.getenv("MIOPEN_STABLE", "1") == "1":
+    tag = os.getenv("MIOPEN_CACHE_TAG", "gpu0")
+    default_user_db = str(Path.home() / ".config" / f"miopen_{tag}")
+    default_cache = str(Path.home() / ".cache" / f"miopen_{tag}")
+
+    os.environ.setdefault("MIOPEN_USER_DB_PATH", default_user_db)
+    os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", default_cache)
+
+    _mkdir_700(os.environ["MIOPEN_USER_DB_PATH"])
+    _mkdir_700(os.environ["MIOPEN_CUSTOM_CACHE_DIR"])
+
+    # These two flags avoid the SQLite DB issues you hit and shorten startup tuning.
+    # Use env to opt-out if you want maximum conv performance later:
+    #   MIOPEN_DISABLE_FIND_DB=0
+    #   MIOPEN_FORCE_CONV_IMMED_FALLBACK=0
+    if os.getenv("MIOPEN_DISABLE_FIND_DB", "1") == "1":
+        os.environ.setdefault("MIOPEN_DEBUG_DISABLE_FIND_DB", "1")
+    if os.getenv("MIOPEN_FORCE_CONV_IMMED_FALLBACK", "1") == "1":
+        os.environ.setdefault("MIOPEN_DEBUG_CONV_IMMED_FALLBACK", "1")
+
+# ----------------------------
+# Imports (after env defaults)
+# ----------------------------
 import cv2
 import numpy as np
 import torch
@@ -30,9 +70,10 @@ class Config:
     lr: float = float(os.getenv("LR", "3e-4"))
     weight_decay: float = float(os.getenv("WEIGHT_DECAY", "0.05"))
 
-    num_workers: int = int(os.getenv("NUM_WORKERS", "16"))
-    prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "4"))
-    persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "1") == "1"
+    # ROCm stability defaults: keep these low unless you have confirmed it’s stable
+    num_workers: int = int(os.getenv("NUM_WORKERS", "2"))
+    prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "2"))
+    persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "0") == "1"
 
     # Cap work per epoch to iterate faster (0 = full epoch)
     max_steps_per_epoch: int = int(os.getenv("MAX_STEPS_PER_EPOCH", "0"))
@@ -72,18 +113,15 @@ def seed_everything(seed: int) -> None:
 
 
 # ----------------------------
-# Dataset
+# Dataset helpers
 # ----------------------------
 
 def _list_npz(dir_path: str) -> List[str]:
     return sorted(glob.glob(os.path.join(dir_path, "*.npz")))
 
-
 def _file_sig(path: str) -> Tuple[int, int]:
-    """Return (mtime_ns, size_bytes) to detect changes."""
     st = os.stat(path)
     return (st.st_mtime_ns, st.st_size)
-
 
 def _load_cache(cache_path: str) -> Dict:
     if not os.path.exists(cache_path):
@@ -94,7 +132,6 @@ def _load_cache(cache_path: str) -> Dict:
     except Exception:
         return {}
 
-
 def _save_cache(cache_path: str, payload: Dict) -> None:
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     tmp = cache_path + ".tmp"
@@ -102,9 +139,7 @@ def _save_cache(cache_path: str, payload: Dict) -> None:
         json.dump(payload, f)
     os.replace(tmp, cache_path)
 
-
 def _count_frames_npz(path: str) -> int:
-    # Note: npz is zipped; mmap_mode does not actually memory-map compressed arrays.
     with np.load(path, allow_pickle=False) as d:
         if "states" in d:
             return int(d["states"].shape[0])
@@ -116,8 +151,7 @@ def _count_frames_npz(path: str) -> int:
 class BalancedMixedDataset(IterableDataset):
     """
     File-balanced mix across available datasets.
-    - If a dataset has fewer files (e.g., 28 recovery chunks), it is cycled up to the max.
-    - Yields (aug1(img), aug2(img)) pairs for VICReg.
+    Yields (aug1(img), aug2(img)) pairs for VICReg.
     """
 
     def __init__(self, cfg: Config):
@@ -185,12 +219,9 @@ class BalancedMixedDataset(IterableDataset):
                 updated[key] = {"sig": list(sig), "frames": frames}
                 total += frames
             except Exception:
-                # Skip unreadable files (you already deleted corrupt chunks; this is a safety net)
                 continue
 
-        cache_out = {"files": updated, "generated_at": time.time()}
-        _save_cache(self.cfg.cache_path, cache_out)
-
+        _save_cache(self.cfg.cache_path, {"files": updated, "generated_at": time.time()})
         print(f"Total Frames: {total:,}")
         return total
 
@@ -212,34 +243,30 @@ class BalancedMixedDataset(IterableDataset):
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
 
-        # Deterministic-but-distinct shuffle per worker
         rng = random.Random(self.cfg.seed + worker_id)
         my_files = self.balanced_files[worker_id::num_workers]
         rng.shuffle(my_files)
+
+        # Also seed numpy per worker so shuffles differ reliably
+        np_rng = np.random.default_rng(self.cfg.seed + worker_id)
 
         for f in my_files:
             try:
                 with np.load(f, allow_pickle=False) as data:
                     raw = data["states"] if "states" in data else data["obs"]
 
-                # If any legacy 96x96 slips in, resize once per file (slow, but rare)
                 if raw.shape[1] != 64:
                     raw = np.array([cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA) for img in raw])
 
-                # Shuffle indices for this shard
-                idxs = np.random.permutation(len(raw))
+                idxs = np_rng.permutation(len(raw))
                 for idx in idxs:
-                    img = torch.from_numpy(raw[idx]).float().div_(255.0)  # HWC float32 in [0,1]
-                    img = img.permute(2, 0, 1)  # CHW
+                    img = torch.from_numpy(raw[idx]).float().div_(255.0)
+                    img = img.permute(2, 0, 1)
                     yield self.transform(img), self.transform(img)
 
             except Exception:
                 continue
 
-
-# ----------------------------
-# Validation
-# ----------------------------
 
 @torch.no_grad()
 def validate_encoder(encoder, projector, val_loader, epoch: int):
@@ -271,10 +298,6 @@ def validate_encoder(encoder, projector, val_loader, epoch: int):
     encoder.train()
     projector.train()
 
-
-# ----------------------------
-# Checkpointing
-# ----------------------------
 
 def _find_latest_ckpt(model_dir: str, ckpt_prefix: str) -> str | None:
     ckpts = glob.glob(os.path.join(model_dir, f"{ckpt_prefix}*.pt"))
@@ -314,27 +337,28 @@ def load_checkpoint(path: str, encoder, projector, optimizer, scheduler, scaler)
     return int(ckpt.get("epoch", 0))
 
 
-# ----------------------------
-# Train
-# ----------------------------
-
 def train():
     os.makedirs(CFG.model_dir, exist_ok=True)
     seed_everything(CFG.seed)
 
-    # perf knobs
+    # Print GPU / HIP info for sanity
+    print(f"torch={torch.__version__} hip={getattr(torch.version, 'hip', None)}")
+    if torch.cuda.is_available():
+        print(f"visible_devices={torch.cuda.device_count()}")
+        print(f"device0={torch.cuda.get_device_name(0)}")
+
+    # perf knobs: avoid benchmark on ROCm (reduces shape-by-shape searching)
+    is_rocm = getattr(torch.version, "hip", None) is not None
     if DEVICE.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False if is_rocm else True
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
 
     dataset = BalancedMixedDataset(CFG)
-
     pin = (DEVICE.type == "cuda")
 
-    # DataLoader kwargs conditioned on workers
     dl_kwargs = dict(
         batch_size=CFG.batch_size,
         num_workers=CFG.num_workers,
@@ -346,7 +370,6 @@ def train():
 
     dataloader = DataLoader(dataset, **dl_kwargs)
 
-    # Small validation stream; keep workers low so it doesn’t contend too much
     val_loader = DataLoader(
         dataset,
         batch_size=CFG.batch_size,
@@ -367,7 +390,6 @@ def train():
     use_amp = (DEVICE.type == "cuda")
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
-    # Resume if checkpoint exists
     start_epoch = 0
     latest = _find_latest_ckpt(CFG.model_dir, CFG.ckpt_prefix)
     if latest:
@@ -408,22 +430,18 @@ def train():
 
         scheduler.step()
 
-        # Validation + save
         epoch_num = epoch + 1
 
         if (epoch_num % CFG.validate_every) == 0:
             validate_encoder(encoder, projector, val_loader, epoch_num)
 
         if (epoch_num % CFG.save_every) == 0:
-            # Full checkpoint (resume-ready)
             ckpt_path = os.path.join(CFG.model_dir, f"{CFG.ckpt_prefix}{epoch_num}.pt")
             save_checkpoint(ckpt_path, epoch_num, encoder, projector, optimizer, scheduler, scaler)
 
-            # Convenience: encoder weights only (drop-in for downstream)
             weights_path = os.path.join(CFG.model_dir, f"{CFG.weights_prefix}{epoch_num}.pth")
             torch.save(encoder.state_dict(), weights_path)
 
-    # Final saves
     final_ckpt = os.path.join(CFG.model_dir, f"{CFG.ckpt_prefix}final.pt")
     save_checkpoint(final_ckpt, CFG.epochs, encoder, projector, optimizer, scheduler, scaler)
 
