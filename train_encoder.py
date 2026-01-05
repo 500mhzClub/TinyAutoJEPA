@@ -16,7 +16,7 @@ from vicreg import vicreg_loss
 BATCH_SIZE = 128
 EPOCHS = 30
 LR = 3e-4
-NUM_WORKERS = 8
+NUM_WORKERS = 20
 WEIGHT_DECAY = 0.05
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
