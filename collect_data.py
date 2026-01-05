@@ -6,7 +6,7 @@ import cv2
 import time
 
 # --- CONFIGURATION ---
-NUM_WORKERS = min(24, mp.cpu_count() - 2)
+NUM_WORKERS = 32
 EPISODES_PER_WORKER = 80
 MAX_STEPS = 600
 DATA_DIR = "data"
@@ -15,59 +15,44 @@ IMG_SIZE = 64
 def process_frame(frame):
     if frame is None:
         return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
-    # Crop bottom status bar (84 pixels height is standard for 96x96 original)
     frame = frame[:84, :, :]
     frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return frame.astype(np.uint8)
 
-def get_speed(env):
-    try:
-        car = env.unwrapped.car if hasattr(env.unwrapped, 'car') else env.car
-        if car is None:
-            return 10.0
-        velocity = car.hull.linearVelocity
-        return np.sqrt(velocity[0]**2 + velocity[1]**2)
-    except:
-        return 10.0
-
-def get_correlated_action(env, previous_steering):
+def get_action_entropy(env, previous_steering):
     """
-    FIXED: Aggressive steering logic to prevent straight-line bias.
+    High-Entropy Random Policy:
+    Designed to explore the edges of the physics engine.
     """
-    speed = get_speed(env)
+    # 1. Full steering range exploration
+    # Sample widely [-1, 1]
+    noise = np.random.uniform(-1.0, 1.0)
+    
+    # 2. Minimal persistence
+    # 20% old, 80% new -> Allows rapid zig-zags
+    new_steer = (0.2 * previous_steering) + (0.8 * noise)
+    new_steer = np.clip(new_steer, -1.0, 1.0)
 
-    # Scale max steering based on speed to prevent constant spinning
-    # At 0 mph: full range [-1.0, 1.0]
-    # At 80 mph: limited to [-0.6, 0.6]
-    max_steer = max(0.6, 1.0 - (speed / 80.0))
-
-    # Generate new random steering noise
-    new_steering = np.random.uniform(-max_steer, max_steer)
-
-    # SMOOTHING FIX: 50/50 mix (was 80/20) allows faster direction changes
-    smoothed_steering = (0.5 * previous_steering) + (0.5 * new_steering)
-    smoothed_steering = np.clip(smoothed_steering, -1.0, 1.0)
-
-    # Dynamic throttle/brake
-    target_speed = np.random.uniform(15, 35)
-
-    if speed < target_speed - 3:
-        gas = np.random.uniform(0.4, 0.8)
+    # 3. Mode Switching (Gas vs Brake)
+    # Prevents "gray zone" behavior where gas/brake are both 0.1
+    mode = np.random.choice(['accelerate', 'brake', 'coast'], p=[0.6, 0.1, 0.3])
+    
+    if mode == 'accelerate':
+        gas = np.random.uniform(0.5, 1.0) # Commit to gas
         brake = 0.0
-    elif speed > target_speed + 3:
+    elif mode == 'brake':
         gas = 0.0
-        brake = np.random.uniform(0.1, 0.4)
+        brake = np.random.uniform(0.2, 0.9) # Commit to brake
     else:
-        gas = np.random.uniform(0.2, 0.5)
+        gas = 0.0
         brake = 0.0
 
-    return np.array([smoothed_steering, gas, brake], dtype=np.float32)
+    return np.array([new_steer, gas, brake], dtype=np.float32)
 
 def worker_func(worker_id):
     seed = int(time.time()) + worker_id * 10000
     np.random.seed(seed)
     
-    # Use render_mode=None for speed
     env = gym.make("CarRacing-v3", render_mode=None)
     
     states, actions, next_states = [], [], []
@@ -75,26 +60,21 @@ def worker_func(worker_id):
     for episode in range(EPISODES_PER_WORKER):
         obs, _ = env.reset(seed=seed + episode)
         
-        # Skip zoom animation
+        # Skip zoom
         for _ in range(50):
             obs, _, _, _, _ = env.step(np.array([0, 0, 0], dtype=np.float32))
         
-        # Randomized spawn: occasionally skip forward to start at different track positions
+        # Random spawn: floor it to get moving
         if episode % 5 < 2:
-            skip_steps = np.random.randint(100, 600)
-            for _ in range(skip_steps):
-                obs, _, done, trunc, _ = env.step(np.array([0, 0.5, 0]))
-                if done or trunc:
-                    obs, _ = env.reset(seed=seed + episode + 999)
-                    for _ in range(50):
-                        obs, _, _, _, _ = env.step(np.array([0, 0, 0]))
-                    break
-        
+            for _ in range(np.random.randint(50, 300)):
+                obs, _, d, t, _ = env.step(np.array([0, 1.0, 0]))
+                if d or t: break
+
         obs = process_frame(obs)
         current_steering = 0.0
         
         for step in range(MAX_STEPS):
-            action = get_correlated_action(env, current_steering)
+            action = get_action_entropy(env, current_steering)
             current_steering = action[0]
             
             next_obs_raw, _, terminated, truncated, _ = env.step(action)
@@ -106,40 +86,20 @@ def worker_func(worker_id):
             next_states.append(next_obs)
             
             obs = next_obs
-            if done:
-                break
+            if done: break
 
-    # Save compressed chunk
     filename = os.path.join(DATA_DIR, f"random_chunk_{worker_id}.npz")
-    np.savez_compressed(
-        filename,
-        states=np.array(states),
-        actions=np.array(actions),
-        next_states=np.array(next_states)
-    )
+    np.savez_compressed(filename, states=np.array(states), actions=np.array(actions), next_states=np.array(next_states))
     env.close()
-    print(f"[Worker {worker_id}] Complete: {len(states)} frames")
+    print(f"[Worker {worker_id}] Complete")
 
 if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
-
-    print(f"=== Random Exploration Data Collection (FIXED) ===")
-    print(f"Workers: {NUM_WORKERS}")
-    print(f"Fixes: Aggressive steering mix, speed scaling, random spawns")
-    print(f"Launching...\n")
-
+    print(f"=== Random Data Collection (High Entropy) ===")
+    print(f"Goal: Steering Std > 0.40")
+    
     mp.set_start_method("spawn", force=True)
     pool = mp.Pool(NUM_WORKERS)
     pool.map(worker_func, range(NUM_WORKERS))
     pool.close()
     pool.join()
-
-    import glob
-    files = glob.glob(os.path.join(DATA_DIR, "*.npz"))
-    total_frames = 0
-    for f in files:
-        with np.load(f) as data:
-            total_frames += len(data['states'])
-            
-    print(f"\n=== Complete ===")
-    print(f"Total frames: {total_frames:,}")
