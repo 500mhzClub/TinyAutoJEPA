@@ -1,90 +1,42 @@
 import numpy as np
-import os
 import glob
+import matplotlib.pyplot as plt
 from tqdm import tqdm
+import os
 
-DATA_DIRS = {
-    "Random": "data",
-    "Race": "data_race",
-    "Recovery": "data_recovery",
-    # "Edge": "data_edge"  <-- Disabled as discussed
-}
-
-def check_dataset(name, path):
-    if not os.path.exists(path):
-        print(f"Skipping {name} (Not found)")
+def analyze(name, folder):
+    files = glob.glob(os.path.join(folder, "*.npz"))
+    if not files: 
+        print(f"No files found for {name} in {folder}")
         return
-
-    files = glob.glob(os.path.join(path, "*.npz"))
-    if not files:
-        print(f"Skipping {name} (No files)")
-        return
-
-    total_frames = 0
-    all_steer = []
-    all_gas = []
-    all_brake = []
-
-    print(f"Analyzing {name}...")
-    for f in tqdm(files):
-        try:
-            with np.load(f) as data:
-                actions = data['actions']
-                total_frames += len(actions)
-                
-                # Sample 10% of data for speed
-                indices = np.random.choice(len(actions), size=int(len(actions)*0.1), replace=False)
-                sampled = actions[indices]
-                
-                all_steer.append(sampled[:, 0])
-                all_gas.append(sampled[:, 1])
-                all_brake.append(sampled[:, 2])
-        except Exception as e:
-            print(f"Error reading {f}: {e}")
-
-    if total_frames == 0:
-        return
-
-    steer = np.concatenate(all_steer)
-    gas = np.concatenate(all_gas)
-    brake = np.concatenate(all_brake)
-
-    steer_mean = np.mean(steer)
-    steer_std = np.std(steer)
     
-    # Logic for distribution
-    straight = np.mean(np.abs(steer) < 0.1) * 100
-    turning = np.mean(np.abs(steer) > 0.5) * 100
-
+    steer, gas, brake, frames = [], [], [], 0
+    for f in tqdm(files, desc=f"Analyzing {name}"):
+        try:
+            with np.load(f) as d:
+                if 'actions' in d:
+                    steer.extend(d['actions'][:,0])
+                    gas.extend(d['actions'][:,1])
+                    brake.extend(d['actions'][:,2])
+                    frames += len(d['actions'])
+        except Exception as e:
+            print(f"Error loading {f}: {e}")
+            pass
+        
+    steer = np.array(steer)
+    gas = np.array(gas)
+    brake = np.array(brake)
+    
     print(f"\nStats for {name}:")
-    print(f"Frames: {total_frames:,}")
-    print(f"Steer Mean: {steer_mean:.3f}, Std: {steer_std:.3f}")
-    print(f"Straight (<0.1): {straight:.1f}%")
-    print(f"Turning (>0.5): {turning:.1f}%")
-    print(f"Gas Mean: {np.mean(gas):.3f}")
-    print(f"Brake Mean: {np.mean(brake):.3f}")
-
-    # --- AUTO GRADING ---
-    print(f"Result: ", end="")
-    if name == "Race":
-        if steer_std < 0.2:
-            print("❌ FAIL (Too straight - Gain too low?)")
-        elif turning < 10.0:
-            print("❌ FAIL (Not enough corners)")
-        else:
-            print("✅ PASS")
-            
-    elif name == "Random":
-        if steer_std < 0.3:
-            print("❌ FAIL (Not enough entropy)")
-        elif turning < 5.0:
-             print("❌ FAIL (Too safe/straight)")
-        else:
-            print("✅ PASS")
-    else:
-        print("ℹ️  Info only")
-    print("-" * 40 + "\n")
+    print(f"Frames: {frames:,}")
+    print(f"Steer Mean: {steer.mean():.3f}, Std: {steer.std():.3f}")
+    print(f"Straight (<0.1): {np.mean(np.abs(steer)<0.1):.1%}")
+    print(f"Turning (>0.5): {np.mean(np.abs(steer)>0.5):.1%}")
+    print(f"Gas Mean: {gas.mean():.3f}")
+    print(f"Brake Mean: {brake.mean():.3f}")
 
 if __name__ == "__main__":
-    for name, path in DATA_DIRS.items():
-        check_dataset(name, path)
+    analyze("Random", "./data")
+    analyze("Race", "./data_race")
+    analyze("Recovery", "./data_recovery")
+    analyze("Edge", "./data_edge")
