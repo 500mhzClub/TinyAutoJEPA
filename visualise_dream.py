@@ -8,12 +8,12 @@ from networks import TinyEncoder, Predictor, TinyDecoder
 
 # --- Configuration ---
 NUM_DREAMS = 5         
-SEQ_LEN = 500          # Longer dreams now possible!
-GROUNDING_INTERVAL = 25 # Reset to reality every 30 frames (Disable with 9999)
+SEQ_LEN = 500          
+GROUNDING_INTERVAL = 25 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model Paths (Updated to your verified files)
+# Model Paths
 ENCODER_PATH   = "./models/encoder_mixed_final.pth"
 PREDICTOR_PATH = "./models/predictor_multistep_final.pth" 
 DECODER_PATH   = "./models/decoder_parallel_ep40.pth"
