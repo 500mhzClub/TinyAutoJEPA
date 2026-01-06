@@ -67,6 +67,7 @@ from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
+print("DEBUG: Imports finished, entering main...", flush=True)
 
 # ----------------------------
 # Distributed helpers
