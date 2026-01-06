@@ -19,7 +19,7 @@ from vicreg import vicreg_loss
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE", "128"))
 EPOCHS        = int(os.getenv("EPOCHS", "30"))
 LR            = float(os.getenv("LR", "3e-4"))
-NUM_WORKERS   = int(os.getenv("NUM_WORKERS", "8"))
+NUM_WORKERS   = int(os.getenv("NUM_WORKERS", "16"))
 WEIGHT_DECAY  = float(os.getenv("WEIGHT_DECAY", "0.05"))
 MODEL_DIR     = os.getenv("MODEL_DIR", "./models")
 
