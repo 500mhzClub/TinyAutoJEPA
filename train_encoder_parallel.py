@@ -54,14 +54,14 @@ _early_miopen_setup()
 # ----------------------------
 # Imports (after early env setup)
 # ----------------------------
-import cv2
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from torchvision import transforms
+import cv2
+import numpy as np
 from tqdm import tqdm
 
 from networks import TinyEncoder, Projector
