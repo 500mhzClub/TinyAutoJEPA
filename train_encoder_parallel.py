@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
 import os
+import sys
+
+# ----------------------------
+# STRICT HARDWARE ISOLATION (CRITICAL FOR MIXED RDNA)
+# ----------------------------
+# Force each process to only see its assigned GPU. 
+# This prevents the driver from crashing/hanging when trying to initialize
+# RDNA2 (gfx1030) and RDNA4 (gfx12xx) contexts simultaneously.
+if os.getenv("LOCAL_RANK") is not None:
+    try:
+        lr = int(os.environ["LOCAL_RANK"])
+        # Each process will think it is on "Device 0" of a 1-GPU system
+        os.environ["HIP_VISIBLE_DEVICES"] = str(lr)
+        os.environ["ROCR_VISIBLE_DEVICES"] = str(lr)
+    except ValueError:
+        pass
+
+# ----------------------------
+# Imports (Must be after isolation, Torch MUST be before CV2)
+# ----------------------------
+import torch
+import cv2
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+from torchvision import transforms
+from tqdm import tqdm
 import re
 import json
 import glob
@@ -10,8 +39,14 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from contextlib import nullcontext, ExitStack
 
+from networks import TinyEncoder, Projector
+from vicreg import vicreg_loss
+
+# Debug print to confirm imports finished successfully
+print(f"DEBUG: Process {os.getenv('LOCAL_RANK', '?')} imports finished. Visible devices: {torch.cuda.device_count()}", flush=True)
+
 # ----------------------------
-# ROCm/MIOpen early setup (must run before torch import)
+# ROCm/MIOpen early setup
 # ----------------------------
 
 def _mkdir_700(p: str) -> None:
@@ -22,16 +57,10 @@ def _mkdir_700(p: str) -> None:
         pass
 
 def _early_miopen_setup() -> None:
-    """
-    Stability-oriented MIOpen settings.
-    - Uses per-local-rank cache dirs by default to avoid DB/cache contention in DDP.
-    - Optional: disable FindDb (SQLite) and force immediate fallback to avoid long finds.
-    """
     if os.getenv("MIOPEN_STABLE", "0") != "1":
         return
 
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
-    # Default per-rank tag to avoid contention when running 2 processes
     tag = os.getenv("MIOPEN_CACHE_TAG", f"gpu{local_rank}")
 
     user_db = os.getenv("MIOPEN_USER_DB_PATH", str(Path.home() / ".config" / f"miopen_{tag}"))
@@ -51,23 +80,6 @@ def _early_miopen_setup() -> None:
 
 _early_miopen_setup()
 
-# ----------------------------
-# Imports (after early env setup)
-# ----------------------------
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-from torch.utils.data import IterableDataset, DataLoader, get_worker_info
-from torchvision import transforms
-import cv2
-import numpy as np
-from tqdm import tqdm
-
-from networks import TinyEncoder, Projector
-from vicreg import vicreg_loss
-
-print("DEBUG: Imports finished, entering main...", flush=True)
 
 # ----------------------------
 # Distributed helpers
@@ -79,7 +91,6 @@ def _is_distributed() -> bool:
 def _ddp_setup() -> Tuple[int, int, int]:
     """
     Returns (rank, local_rank, world_size).
-    If WORLD_SIZE>1, initializes process group and sets correct CUDA device.
     """
     if not _is_distributed():
         return 0, 0, 1
@@ -90,7 +101,13 @@ def _ddp_setup() -> Tuple[int, int, int]:
 
     # ROCm: backend is still "nccl" (maps to RCCL under the hood)
     dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(local_rank)
+    
+    # CRITICAL CHANGE: Because we masked the devices at the top of the file,
+    # every process sees only 1 GPU. That GPU is always index 0.
+    # We fallback to local_rank only if isolation failed (device_count > 1).
+    dev_id = 0 if torch.cuda.device_count() == 1 else local_rank
+    torch.cuda.set_device(dev_id)
+    
     return rank, local_rank, world_size
 
 def _ddp_cleanup() -> None:
@@ -191,14 +208,6 @@ def _count_frames_npz(path: str) -> int:
 
 
 class BalancedMixedDataset(IterableDataset):
-    """
-    File-balanced mix across datasets. Yields (aug1(img), aug2(img)) for VICReg.
-
-    DDP sharding:
-      - First shard files by rank/world_size: files[rank::world_size]
-      - Then shard by dataloader worker within each rank: files[worker_id::num_workers]
-    """
-
     def __init__(self, cfg: Config, rank: int, world_size: int, cache_path: str):
         super().__init__()
         self.cfg = cfg
@@ -252,8 +261,6 @@ class BalancedMixedDataset(IterableDataset):
         ])
 
     def _scan_total_frames(self) -> int:
-        # Scan *all* files for a consistent total count (fine for progress/estimates).
-        # Use per-rank cache file to avoid concurrent writes.
         files_to_scan = self.balanced_files
 
         if not self.cfg.cache_scan:
@@ -406,8 +413,13 @@ def load_checkpoint(path: str, encoder: nn.Module, projector: nn.Module, optimiz
 
 
 def main():
+    # Setup DDP
     rank, local_rank, world_size = _ddp_setup()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # After _ddp_setup, the current process is already bound to "device 0" of its isolated context
+    # unless isolation failed (then fallback to local_rank)
+    dev_id = 0 if torch.cuda.device_count() == 1 else local_rank
+    device = torch.device(f"cuda:{dev_id}")
 
     # Rank-aware cache file to avoid concurrent writes
     cache_path = CFG.cache_path
@@ -466,8 +478,9 @@ def main():
 
     # Wrap in DDP if needed
     if world_size > 1:
-        encoder = torch.nn.parallel.DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank)
-        projector = torch.nn.parallel.DistributedDataParallel(projector, device_ids=[local_rank], output_device=local_rank)
+        # CRITICAL: output_device must match the isolated device ID (usually 0)
+        encoder = torch.nn.parallel.DistributedDataParallel(encoder, device_ids=[dev_id], output_device=dev_id)
+        projector = torch.nn.parallel.DistributedDataParallel(projector, device_ids=[dev_id], output_device=dev_id)
 
     params = list(encoder.parameters()) + list(projector.parameters())
     optimizer = optim.AdamW(params, lr=CFG.lr, weight_decay=CFG.weight_decay)
