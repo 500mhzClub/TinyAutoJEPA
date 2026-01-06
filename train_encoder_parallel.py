@@ -8,14 +8,14 @@ import sys
 # Force each process to only see its assigned GPU. 
 # This prevents the driver from crashing/hanging when trying to initialize
 # RDNA2 (gfx1030) and RDNA4 (gfx12xx) contexts simultaneously.
-if os.getenv("LOCAL_RANK") is not None:
-    try:
-        lr = int(os.environ["LOCAL_RANK"])
-        # Each process will think it is on "Device 0" of a 1-GPU system
-        os.environ["HIP_VISIBLE_DEVICES"] = str(lr)
-        os.environ["ROCR_VISIBLE_DEVICES"] = str(lr)
-    except ValueError:
-        pass
+# if os.getenv("LOCAL_RANK") is not None:
+#     try:
+#         lr = int(os.environ["LOCAL_RANK"])
+#         # Each process will think it is on "Device 0" of a 1-GPU system
+#         os.environ["HIP_VISIBLE_DEVICES"] = str(lr)
+#         os.environ["ROCR_VISIBLE_DEVICES"] = str(lr)
+#     except ValueError:
+#         pass
 
 # ----------------------------
 # Imports (Must be after isolation, Torch MUST be before CV2)
