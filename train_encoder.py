@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import re
 import json
@@ -43,7 +44,7 @@ def _rocm_miopen_early_setup() -> None:
     _mkdir_700(user_db)
     _mkdir_700(cache_dir)
 
-    # Disable FindDb to avoid SQLite DB failures (your sqlite_db.cpp:227 crash).
+    # Disable FindDb to avoid SQLite DB failures (sqlite_db.cpp errors).
     if os.getenv("MIOPEN_DISABLE_FIND_DB", "0") == "1":
         os.environ["MIOPEN_DEBUG_DISABLE_FIND_DB"] = "1"
 
@@ -92,8 +93,18 @@ class Config:
 
     # Validation/checkpoint cadence
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
-    save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
-    ckpt_every_steps: int = int(os.getenv("CKPT_EVERY_STEPS", "2000"))  # 0 disables step ckpt
+
+    # IMPORTANT: reduce folder spam by default:
+    # - epoch checkpoints only every 5 epochs
+    save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))
+
+    # Step checkpoints: set to 5000 by default (roughly every ~10 minutes in your regime).
+    # If you set this to 5, the prune logic below will prevent runaway disk usage.
+    ckpt_every_steps: int = int(os.getenv("CKPT_EVERY_STEPS", "5000"))
+
+    # Pruning: keep only the most recent N checkpoints of each type
+    max_step_ckpts: int = int(os.getenv("MAX_STEP_CKPTS", "6"))
+    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "10"))
 
     # Repro
     seed: int = int(os.getenv("SEED", "1337"))
@@ -115,6 +126,11 @@ class Config:
     model_dir: str = os.getenv("MODEL_DIR", "./models")
     ckpt_prefix: str = os.getenv("CKPT_PREFIX", "encoder_ckpt_ep")
     weights_prefix: str = os.getenv("WEIGHTS_PREFIX", "encoder_ep")
+
+    # Warm start / resume behavior
+    # - If WARM_START_ENCODER/PROJECTOR is set, we DO NOT auto-resume by default.
+    # - You can force resume with RESUME_FROM_LATEST=1.
+    resume_from_latest: bool = os.getenv("RESUME_FROM_LATEST", "1") == "1"
 
 CFG = Config()
 DEVICE = torch.device(CFG.device)
@@ -238,7 +254,6 @@ class BalancedMixedDataset(IterableDataset):
                 updated[key] = {"sig": list(sig), "frames": frames}
                 total += frames
             except Exception:
-                # Skip corrupt files, continue scanning
                 continue
 
         _save_cache(self.cfg.cache_path, {"files": updated, "generated_at": time.time()})
@@ -287,7 +302,6 @@ class BalancedMixedDataset(IterableDataset):
                     yield self.transform(img), self.transform(img)
 
             except Exception:
-                # Skip corrupt file
                 continue
 
 
@@ -322,16 +336,54 @@ def validate_encoder(encoder, projector, val_loader, epoch: int):
     projector.train()
 
 
+def _parse_ckpt_sort_key(path: str) -> Tuple[int, int]:
+    """
+    Sort key: (epoch, step) extracted from filename if possible; else (0, mtime_ns).
+    Supports:
+      encoder_ckpt_ep12.pt
+      encoder_ckpt_ep12_step45000.pt
+    """
+    base = os.path.basename(path)
+    ep = 0
+    st = 0
+
+    m = re.search(r"ep(\d+)", base)
+    if m:
+        ep = int(m.group(1))
+
+    m2 = re.search(r"step(\d+)", base)
+    if m2:
+        st = int(m2.group(1))
+    else:
+        # fall back to mtime for epoch-only ckpts
+        try:
+            st = int(os.stat(path).st_mtime_ns)
+        except Exception:
+            st = 0
+
+    return (ep, st)
+
+
 def _find_latest_ckpt(model_dir: str, ckpt_prefix: str) -> Optional[str]:
     ckpts = glob.glob(os.path.join(model_dir, f"{ckpt_prefix}*.pt"))
     if not ckpts:
         return None
+    return max(ckpts, key=_parse_ckpt_sort_key)
 
-    def ep_num(path: str) -> int:
-        m = re.search(r"ep(\d+)", os.path.basename(path))
-        return int(m.group(1)) if m else -1
 
-    return max(ckpts, key=ep_num)
+def _prune_checkpoints(model_dir: str, pattern: str, keep: int) -> None:
+    if keep <= 0:
+        return
+    paths = glob.glob(os.path.join(model_dir, pattern))
+    if len(paths) <= keep:
+        return
+    paths_sorted = sorted(paths, key=_parse_ckpt_sort_key)
+    to_delete = paths_sorted[:-keep]
+    for p in to_delete:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
 
 
 def save_checkpoint(path: str, epoch: int, global_step: int, encoder, projector, optimizer, scheduler, scaler):
@@ -363,6 +415,28 @@ def load_checkpoint(path: str, encoder, projector, optimizer, scheduler, scaler)
     return epoch, global_step
 
 
+def _maybe_warm_start(encoder, projector) -> bool:
+    """
+    Returns True if warm start was applied.
+    If warm start is used, we expect a fresh optimizer/scheduler (i.e., do not auto-resume by default).
+    """
+    warm_enc = os.getenv("WARM_START_ENCODER", "").strip()
+    warm_proj = os.getenv("WARM_START_PROJECTOR", "").strip()
+    used = False
+
+    if warm_enc:
+        print(f"Warm-start encoder from: {warm_enc}")
+        encoder.load_state_dict(torch.load(warm_enc, map_location=DEVICE))
+        used = True
+
+    if warm_proj:
+        print(f"Warm-start projector from: {warm_proj}")
+        projector.load_state_dict(torch.load(warm_proj, map_location=DEVICE))
+        used = True
+
+    return used
+
+
 def train():
     os.makedirs(CFG.model_dir, exist_ok=True)
     seed_everything(CFG.seed)
@@ -373,7 +447,6 @@ def train():
         print(f"visible_devices={torch.cuda.device_count()}")
         print(f"device0={torch.cuda.get_device_name(0)}")
 
-    # ROCm: avoid benchmark heuristics which can amplify tuning behavior across shapes
     is_rocm = getattr(torch.version, "hip", None) is not None
     if DEVICE.type == "cuda":
         torch.backends.cudnn.benchmark = False if is_rocm else True
@@ -399,7 +472,6 @@ def train():
 
     dataloader = DataLoader(dataset, **dl_kwargs)
 
-    # Small validation loader to monitor collapse
     val_loader = DataLoader(
         dataset,
         batch_size=CFG.batch_size,
@@ -409,6 +481,9 @@ def train():
 
     encoder = TinyEncoder().to(DEVICE)
     projector = Projector().to(DEVICE)
+
+    # Warm start BEFORE optimizer creation (so optimizer starts "clean")
+    used_warm = _maybe_warm_start(encoder, projector)
 
     optimizer = optim.AdamW(
         list(encoder.parameters()) + list(projector.parameters()),
@@ -423,11 +498,19 @@ def train():
     start_epoch = 0
     global_step = 0
 
-    latest = _find_latest_ckpt(CFG.model_dir, CFG.ckpt_prefix)
-    if latest:
-        print(f"Resuming from checkpoint: {latest}")
-        start_epoch, global_step = load_checkpoint(latest, encoder, projector, optimizer, scheduler, scaler)
-        print(f"Resumed at epoch {start_epoch} (next epoch will be {start_epoch + 1}), global_step={global_step}")
+    # Auto-resume logic:
+    # - If warm-start is used, skip resuming unless RESUME_FROM_LATEST=1 is explicitly set.
+    #   (This avoids accidentally pulling in old optimizer/scheduler states.)
+    allow_resume = CFG.resume_from_latest and (not used_warm or os.getenv("FORCE_RESUME_WITH_WARM", "0") == "1")
+    if allow_resume:
+        latest = _find_latest_ckpt(CFG.model_dir, CFG.ckpt_prefix)
+        if latest:
+            print(f"Resuming from checkpoint: {latest}")
+            start_epoch, global_step = load_checkpoint(latest, encoder, projector, optimizer, scheduler, scaler)
+            print(f"Resumed at epoch {start_epoch} (next epoch will be {start_epoch + 1}), global_step={global_step}")
+    else:
+        if used_warm:
+            print("Warm-start enabled: starting with fresh optimizer/scheduler (no checkpoint resume).")
 
     encoder.train()
     projector.train()
@@ -437,8 +520,6 @@ def train():
 
     for epoch in range(start_epoch, CFG.epochs):
         pbar = tqdm(dataloader, total=steps_this_epoch, desc=f"Epoch {epoch+1}/{CFG.epochs}")
-
-        # We step optimizer every accum_steps micro-batches.
         optimizer.zero_grad(set_to_none=True)
 
         for step, (x1, x2) in enumerate(pbar):
@@ -469,26 +550,25 @@ def train():
 
             global_step += 1
 
-            # Throughput reporting: images/sec uses micro-batch size
             it_s = pbar.format_dict.get("rate", None)
             imgs_s = (it_s * CFG.batch_size) if (it_s is not None) else None
 
             postfix = {
-                "loss": f"{(loss.item() * CFG.accum_steps):.4f}",  # unscaled loss for readability
+                "loss": f"{(loss.item() * CFG.accum_steps):.4f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.6f}",
                 "eff_bs": f"{CFG.batch_size * CFG.accum_steps}",
             }
             if imgs_s is not None:
                 postfix["img/s"] = f"{imgs_s:.0f}"
-
             pbar.set_postfix(postfix)
 
-            # Step-based checkpointing (safer for long runs)
+            # Step-based checkpointing (with pruning)
             if CFG.ckpt_every_steps > 0 and (global_step % CFG.ckpt_every_steps == 0):
                 ckpt_path = os.path.join(CFG.model_dir, f"{CFG.ckpt_prefix}{epoch+1}_step{global_step}.pt")
                 save_checkpoint(ckpt_path, epoch + 1, global_step, encoder, projector, optimizer, scheduler, scaler)
+                _prune_checkpoints(CFG.model_dir, f"{CFG.ckpt_prefix}*_step*.pt", CFG.max_step_ckpts)
 
-        # If epoch ended mid-accumulation, flush remaining grads
+        # Flush remaining grads if epoch ended mid-accumulation
         if (step + 1) % CFG.accum_steps != 0:
             if use_amp:
                 scaler.step(optimizer)
@@ -504,18 +584,24 @@ def train():
         if CFG.validate_every_epochs > 0 and (epoch_num % CFG.validate_every_epochs) == 0:
             validate_encoder(encoder, projector, val_loader, epoch_num)
 
+        # Epoch checkpointing (with pruning)
         if CFG.save_every_epochs > 0 and (epoch_num % CFG.save_every_epochs) == 0:
             ckpt_path = os.path.join(CFG.model_dir, f"{CFG.ckpt_prefix}{epoch_num}.pt")
             save_checkpoint(ckpt_path, epoch_num, global_step, encoder, projector, optimizer, scheduler, scaler)
+            _prune_checkpoints(CFG.model_dir, f"{CFG.ckpt_prefix}[0-9]*.pt", CFG.max_epoch_ckpts)
 
             weights_path = os.path.join(CFG.model_dir, f"{CFG.weights_prefix}{epoch_num}.pth")
             torch.save(encoder.state_dict(), weights_path)
 
+    # Always save final artifacts (and prune)
     final_ckpt = os.path.join(CFG.model_dir, f"{CFG.ckpt_prefix}final.pt")
     save_checkpoint(final_ckpt, CFG.epochs, global_step, encoder, projector, optimizer, scheduler, scaler)
 
     final_weights = os.path.join(CFG.model_dir, "encoder_final.pth")
     torch.save(encoder.state_dict(), final_weights)
+
+    _prune_checkpoints(CFG.model_dir, f"{CFG.ckpt_prefix}*_step*.pt", CFG.max_step_ckpts)
+    _prune_checkpoints(CFG.model_dir, f"{CFG.ckpt_prefix}[0-9]*.pt", CFG.max_epoch_ckpts)
 
 
 if __name__ == "__main__":
