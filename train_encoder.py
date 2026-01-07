@@ -3,6 +3,8 @@ import re
 import glob
 import math
 import random
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -15,33 +17,108 @@ from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
-# --- CONFIGURATION (env-overridable, but defaults match your old script) ---
-BATCH_SIZE    = int(os.getenv("BATCH_SIZE", "128"))
-EPOCHS        = int(os.getenv("EPOCHS", "30"))
-LR            = float(os.getenv("LR", "3e-4"))
-NUM_WORKERS   = int(os.getenv("NUM_WORKERS", "16"))
-WEIGHT_DECAY  = float(os.getenv("WEIGHT_DECAY", "0.05"))
-MODEL_DIR     = os.getenv("MODEL_DIR", "./models")
 
-# Save cadence: matches your old behaviour (save every 5 epochs)
-SAVE_EVERY_EPOCHS      = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))          # encoder weights + full ckpt
-VALIDATE_EVERY_EPOCHS  = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))      # validate when saving
+# ----------------------------
+# Config (env-overridable)
+# ----------------------------
 
-# Resume controls
-RESUME                = os.getenv("RESUME", "1") == "1"
-RESUME_FULL_IF_AVAIL  = os.getenv("RESUME_FULL_IF_AVAIL", "1") == "1"
+@dataclass
+class CFG:
+    # Training defaults match your old script
+    batch_size: int = int(os.getenv("BATCH_SIZE", "128"))
+    epochs: int = int(os.getenv("EPOCHS", "30"))
+    lr: float = float(os.getenv("LR", "3e-4"))
+    weight_decay: float = float(os.getenv("WEIGHT_DECAY", "0.05"))
 
-DEVICE = torch.device(os.getenv("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
+    # DataLoader
+    num_workers: int = int(os.getenv("NUM_WORKERS", "8"))
+    prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "2"))
+    persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "0") == "1"
+
+    # Dataset dirs
+    data_random: str = os.getenv("DATA_RANDOM", "./data")
+    data_race: str = os.getenv("DATA_RACE", "./data_race")
+    data_recovery: str = os.getenv("DATA_RECOVERY", "./data_recovery")
+    data_edge: str = os.getenv("DATA_EDGE", "./data_edge")
+
+    # Saving / validation cadence (old behaviour: every 5 epochs)
+    model_dir: str = os.getenv("MODEL_DIR", "./models")
+    save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))
+    validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
+    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  # prune old ckpts/weights (0 = keep all)
+
+    # Resume / warm-start
+    resume: bool = os.getenv("RESUME", "1") == "1"
+    resume_full_if_avail: bool = os.getenv("RESUME_FULL_IF_AVAIL", "1") == "1"
+    warm_start_encoder: str = os.getenv("WARM_START_ENCODER", "")  # path to .pth encoder weights (fresh opt/sched)
+
+    # Validation tuning
+    val_num_batches: int = int(os.getenv("VAL_NUM_BATCHES", "20"))
+    dead_std_thr: float = float(os.getenv("DEAD_STD_THR", "0.01"))
+
+    # Repro
+    seed: int = int(os.getenv("SEED", "1337"))
+
+    # Device
+    device: str = os.getenv("DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+CFG = CFG()
+DEVICE = torch.device(CFG.device)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id: int) -> None:
+    # Make per-worker randomness consistent and independent
+    s = CFG.seed + worker_id
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+
+
+# ----------------------------
+# Dataset
+# ----------------------------
+
+def _list_npz(dir_path: str) -> List[str]:
+    if not dir_path:
+        return []
+    return sorted(glob.glob(os.path.join(dir_path, "*.npz")))
+
+
+def _count_frames_npz(path: str) -> int:
+    with np.load(path, mmap_mode="r", allow_pickle=False) as d:
+        if "states" in d:
+            return int(d["states"].shape[0])
+        if "obs" in d:
+            return int(d["obs"].shape[0])
+    return 0
 
 
 class BalancedMixedDataset(IterableDataset):
-    def __init__(self):
-        self.random_files = sorted(glob.glob("./data/*.npz"))
-        self.race_files = sorted(glob.glob("./data_race/*.npz"))
-        self.recovery_files = sorted(glob.glob("./data_recovery/*.npz"))
-        self.edge_files = sorted(glob.glob("./data_edge/*.npz"))
+    """
+    Balanced 4-way mix (random/race/recovery/edge) by file count.
+    Yields (aug(img), aug(img)) for VICReg.
+    """
 
-        # Create balanced 4-way mix
+    def __init__(self):
+        super().__init__()
+
+        self.random_files = _list_npz(CFG.data_random)
+        self.race_files = _list_npz(CFG.data_race)
+        self.recovery_files = _list_npz(CFG.data_recovery)
+        self.edge_files = _list_npz(CFG.data_edge)
+
+        if not (self.random_files or self.race_files or self.recovery_files or self.edge_files):
+            raise RuntimeError("No .npz files found in any data directories.")
+
         max_files = max(
             len(self.random_files),
             len(self.race_files),
@@ -49,29 +126,29 @@ class BalancedMixedDataset(IterableDataset):
             len(self.edge_files),
         )
 
-        self.balanced_files = []
+        self.balanced_files: List[str] = []
         for i in range(max_files):
-            if self.random_files:   self.balanced_files.append(self.random_files[i % len(self.random_files)])
-            if self.race_files:     self.balanced_files.append(self.race_files[i % len(self.race_files)])
-            if self.recovery_files: self.balanced_files.append(self.recovery_files[i % len(self.recovery_files)])
-            if self.edge_files:     self.balanced_files.append(self.edge_files[i % len(self.edge_files)])
+            if self.random_files:
+                self.balanced_files.append(self.random_files[i % len(self.random_files)])
+            if self.race_files:
+                self.balanced_files.append(self.race_files[i % len(self.race_files)])
+            if self.recovery_files:
+                self.balanced_files.append(self.recovery_files[i % len(self.recovery_files)])
+            if self.edge_files:
+                self.balanced_files.append(self.edge_files[i % len(self.edge_files)])
 
         print(f"Balanced Dataset: {len(self.balanced_files)} files.")
 
-        # Calculate total frames (kept same style, just made it a bit safer)
+        # Scan total frames (same spirit as old script; safer and supports obs fallback)
         self.total_frames = 0
         for f in tqdm(self.balanced_files, desc="Scanning Dataset"):
             try:
-                with np.load(f, mmap_mode="r", allow_pickle=False) as d:
-                    if "states" in d:
-                        self.total_frames += d["states"].shape[0]
-                    elif "obs" in d:
-                        self.total_frames += d["obs"].shape[0]
+                self.total_frames += _count_frames_npz(f)
             except Exception:
                 pass
         print(f"Total Frames: {self.total_frames:,}")
 
-        # TRANSFORM: same as your old script
+        # Same transform style as your old script (no horizontal flip)
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(64, scale=(0.85, 1.0)),
             transforms.ColorJitter(0.3, 0.3, 0.2, 0.1),
@@ -80,26 +157,34 @@ class BalancedMixedDataset(IterableDataset):
         ])
 
     def __iter__(self):
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            my_files = self.balanced_files[worker_info.id::worker_info.num_workers]
-        else:
-            my_files = list(self.balanced_files)
+        info = get_worker_info()
+        worker_id = info.id if info else 0
+        num_workers = info.num_workers if info else 1
 
-        random.shuffle(my_files)
+        # Deterministic local RNG per worker (avoids global random usage)
+        rng = random.Random(CFG.seed + worker_id)
+        np_rng = np.random.default_rng(CFG.seed + worker_id)
+
+        my_files = self.balanced_files[worker_id::num_workers]
+        my_files = list(my_files)
+        rng.shuffle(my_files)
 
         for f in my_files:
             try:
                 with np.load(f, allow_pickle=False) as data:
                     raw = data["states"] if "states" in data else data["obs"]
 
+                # Ensure 64x64 (and keep uint8->float conversion later)
                 if raw.shape[1] != 64 or raw.shape[2] != 64:
-                    raw = np.array([cv2.resize(i, (64, 64), interpolation=cv2.INTER_AREA) for i in raw])
+                    raw = np.array(
+                        [cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA) for img in raw],
+                        dtype=raw.dtype,
+                    )
 
-                indices = np.random.permutation(len(raw))
-                for idx in indices:
-                    img = torch.from_numpy(raw[idx]).float() / 255.0
-                    img = img.permute(2, 0, 1)  # HWC -> CHW
+                idxs = np_rng.permutation(len(raw))
+                for idx in idxs:
+                    img = torch.from_numpy(raw[idx]).float().div_(255.0)  # [H,W,C]
+                    img = img.permute(2, 0, 1)  # [C,H,W]
                     yield self.transform(img), self.transform(img)
 
             except Exception:
@@ -109,45 +194,87 @@ class BalancedMixedDataset(IterableDataset):
         return self.total_frames
 
 
+# ----------------------------
+# Validation (scale-aware)
+# ----------------------------
+
 @torch.no_grad()
-def validate_encoder(encoder, val_loader, epoch: int):
+def validate_encoder(encoder, projector, val_loader, epoch: int) -> None:
+    """
+    Reports encoder/projector health in a way that distinguishes:
+    - “scale shrinkage” (raw std small, but L2-normalized std OK) from
+    - true collapse (both raw and normalized low-variance).
+    """
     encoder.eval()
-    all_embeddings = []
+    projector.eval()
+
+    zs_enc = []
+    zs_prj = []
 
     for i, (x1, _) in enumerate(val_loader):
-        if i >= 10:
+        if i >= CFG.val_num_batches:
             break
         x1 = x1.to(DEVICE, non_blocking=True)
         z = encoder(x1)
-        all_embeddings.append(z.detach().cpu())
+        p = projector(z)
+        zs_enc.append(z.detach().float().cpu())
+        zs_prj.append(p.detach().float().cpu())
 
-    if not all_embeddings:
+    if not zs_enc:
         print(f"\n[Validation Epoch {epoch}] No validation batches available.")
         encoder.train()
+        projector.train()
         return
 
-    z_all = torch.cat(all_embeddings, dim=0)
-    std_per_dim = z_all.std(dim=0)
-    dead_dims = int((std_per_dim < 0.01).sum().item())
+    z_enc = torch.cat(zs_enc, dim=0)
+    z_prj = torch.cat(zs_prj, dim=0)
 
-    print(f"\n[Validation Epoch {epoch}]")
-    print(f"  Dead dimensions: {dead_dims}/512")
-    print(f"  Avg Std: {std_per_dim.mean().item():.4f}")
+    def report(name: str, z: torch.Tensor) -> None:
+        thr = CFG.dead_std_thr
+
+        std_per_dim = z.std(dim=0)
+        dead_abs = int((std_per_dim < thr).sum().item())
+        avg_std = float(std_per_dim.mean().item())
+
+        norms = z.norm(dim=1)
+        mean_norm = float(norms.mean().item())
+        std_norm = float(norms.std().item())
+
+        z_n = z / (norms.unsqueeze(1) + 1e-8)
+        std_per_dim_n = z_n.std(dim=0)
+        dead_norm = int((std_per_dim_n < thr).sum().item())
+        avg_std_n = float(std_per_dim_n.mean().item())
+
+        print(f"  [{name}]")
+        print(f"    ||z|| mean/std: {mean_norm:.4f} / {std_norm:.4f}")
+        print(f"    Avg Std (raw): {avg_std:.4f}  Dead@{thr:g}: {dead_abs}/{z.shape[1]}")
+        print(f"    Avg Std (L2):  {avg_std_n:.4f}  Dead@{thr:g}: {dead_norm}/{z.shape[1]}")
+
+    print(f"\n[Validation Epoch {epoch}] batches={CFG.val_num_batches} samples={z_enc.shape[0]}")
+    report("ENCODER", z_enc)
+    report("PROJECTOR", z_prj)
 
     encoder.train()
+    projector.train()
 
 
-def _latest_epoch_file(pattern: str) -> str | None:
+# ----------------------------
+# Checkpoint helpers
+# ----------------------------
+
+def _epoch_from_name(path: str) -> int:
+    m = re.search(r"ep(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+
+def _latest_by_epoch(pattern: str) -> Optional[str]:
     files = glob.glob(pattern)
     if not files:
         return None
-    def ep_num(p: str) -> int:
-        m = re.search(r"ep(\d+)", os.path.basename(p))
-        return int(m.group(1)) if m else -1
-    return max(files, key=ep_num)
+    return max(files, key=_epoch_from_name)
 
 
-def save_full_ckpt(path: str, epoch: int, global_step: int, encoder, projector, optimizer, scheduler, scaler):
+def save_full_ckpt(path: str, epoch: int, global_step: int, encoder, projector, optimizer, scheduler, scaler) -> None:
     tmp = path + ".tmp"
     payload = {
         "epoch": epoch,
@@ -157,17 +284,18 @@ def save_full_ckpt(path: str, epoch: int, global_step: int, encoder, projector, 
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
-        "meta": {
-            "batch_size": BATCH_SIZE,
-            "lr": LR,
-            "weight_decay": WEIGHT_DECAY,
+        "cfg": {
+            "batch_size": CFG.batch_size,
+            "epochs": CFG.epochs,
+            "lr": CFG.lr,
+            "weight_decay": CFG.weight_decay,
         },
     }
     torch.save(payload, tmp)
     os.replace(tmp, path)
 
 
-def load_full_ckpt(path: str, encoder, projector, optimizer, scheduler, scaler):
+def load_full_ckpt(path: str, encoder, projector, optimizer, scheduler, scaler) -> Tuple[int, int]:
     ckpt = torch.load(path, map_location=DEVICE)
     encoder.load_state_dict(ckpt["encoder"])
     projector.load_state_dict(ckpt["projector"])
@@ -178,68 +306,115 @@ def load_full_ckpt(path: str, encoder, projector, optimizer, scheduler, scaler):
     return int(ckpt.get("epoch", 0)), int(ckpt.get("global_step", 0))
 
 
-def train():
-    os.makedirs(MODEL_DIR, exist_ok=True)
+def _prune_old(pattern: str, keep: int) -> None:
+    if keep <= 0:
+        return
+    files = glob.glob(pattern)
+    if len(files) <= keep:
+        return
+    files_sorted = sorted(files, key=_epoch_from_name)
+    for f in files_sorted[:-keep]:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+
+# ----------------------------
+# Train
+# ----------------------------
+
+def train() -> None:
+    os.makedirs(CFG.model_dir, exist_ok=True)
+    seed_everything(CFG.seed)
+
+    print(f"torch={torch.__version__} hip={getattr(torch.version, 'hip', None)}")
+    if torch.cuda.is_available():
+        print(f"visible_devices={torch.cuda.device_count()}")
+        print(f"device0={torch.cuda.get_device_name(0)}")
 
     dataset = BalancedMixedDataset()
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=(DEVICE.type == "cuda"),
-        prefetch_factor=2 if NUM_WORKERS > 0 else None,
-    )
 
-    # Validation loader (kept close to your original)
-    val_loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=2)
+    # IMPORTANT: IterableDataset => DataLoader can yield until dataset exhausts.
+    # We compute the expected batch count and hard-stop to avoid “extra iteration” drift.
+    steps_per_epoch = max(1, math.ceil(dataset.total_frames / CFG.batch_size))
+
+    dl_kwargs = dict(
+        batch_size=CFG.batch_size,
+        num_workers=CFG.num_workers,
+        pin_memory=(DEVICE.type == "cuda"),
+        worker_init_fn=worker_init_fn if CFG.num_workers > 0 else None,
+    )
+    if CFG.num_workers > 0:
+        dl_kwargs["prefetch_factor"] = CFG.prefetch_factor
+        dl_kwargs["persistent_workers"] = CFG.persistent_workers
+
+    dataloader = DataLoader(dataset, **dl_kwargs)
+
+    # Validation loader (separate iterator; keep it lightweight)
+    val_loader = DataLoader(
+        dataset,
+        batch_size=CFG.batch_size,
+        num_workers=min(2, CFG.num_workers),
+        pin_memory=(DEVICE.type == "cuda"),
+        worker_init_fn=worker_init_fn if min(2, CFG.num_workers) > 0 else None,
+    )
 
     encoder = TinyEncoder().to(DEVICE)
     projector = Projector().to(DEVICE)
 
     optimizer = optim.AdamW(
         list(encoder.parameters()) + list(projector.parameters()),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
+        lr=CFG.lr,
+        weight_decay=CFG.weight_decay,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
-    scaler = torch.amp.GradScaler("cuda") if DEVICE.type == "cuda" else None
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.epochs, eta_min=1e-5)
+
+    use_amp = (DEVICE.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     start_epoch = 0
     global_step = 0
 
-    if RESUME:
-        # Prefer full-state resume if available (prevents projector randomisation)
-        full_ckpt = _latest_epoch_file(os.path.join(MODEL_DIR, "encoder_mixed_ckpt_ep*.pt"))
-        enc_only = _latest_epoch_file(os.path.join(MODEL_DIR, "encoder_mixed_ep*.pth"))
+    # Warm-start takes precedence (fresh opt/sched), because it is explicit
+    if CFG.warm_start_encoder:
+        print(f"Warm-start encoder from: {CFG.warm_start_encoder}")
+        encoder.load_state_dict(torch.load(CFG.warm_start_encoder, map_location=DEVICE))
+        print("Warm-start enabled: starting with fresh optimizer/scheduler (no checkpoint resume).")
+    elif CFG.resume:
+        full_ckpt = _latest_by_epoch(os.path.join(CFG.model_dir, "encoder_mixed_ckpt_ep*.pt"))
+        enc_only = _latest_by_epoch(os.path.join(CFG.model_dir, "encoder_mixed_ep*.pth"))
 
-        if RESUME_FULL_IF_AVAIL and full_ckpt is not None:
+        if CFG.resume_full_if_avail and full_ckpt is not None:
             print(f"Resuming FULL state from {full_ckpt}")
             start_epoch, global_step = load_full_ckpt(full_ckpt, encoder, projector, optimizer, scheduler, scaler)
-            # start_epoch is the epoch number already completed
         elif enc_only is not None:
-            # Legacy behaviour (your old script)
             print(f"Resuming ENCODER ONLY from {enc_only}")
             encoder.load_state_dict(torch.load(enc_only, map_location=DEVICE))
-            start_epoch = int(re.search(r"ep(\d+)", enc_only).group(1))
+            start_epoch = _epoch_from_name(enc_only)
+            # Advance scheduler to match completed epochs (legacy behaviour)
             for _ in range(start_epoch):
                 scheduler.step()
 
     encoder.train()
     projector.train()
 
-    # FIX: use ceil to avoid tqdm "extra iteration" confusion
-    steps = max(1, math.ceil(dataset.total_frames / BATCH_SIZE))
+    for epoch in range(start_epoch, CFG.epochs):
+        pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}/{CFG.epochs}")
+        it = iter(dataloader)
 
-    for epoch in range(start_epoch, EPOCHS):
-        pbar = tqdm(dataloader, total=steps, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        for step in range(steps_per_epoch):
+            try:
+                x1, x2 = next(it)
+            except StopIteration:
+                break
 
-        for x1, x2 in pbar:
             x1 = x1.to(DEVICE, non_blocking=True)
             x2 = x2.to(DEVICE, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            if DEVICE.type == "cuda":
+            if use_amp:
                 with torch.amp.autocast("cuda"):
                     loss = vicreg_loss(projector(encoder(x1)), projector(encoder(x2)))
                 scaler.scale(loss).backward()
@@ -252,21 +427,41 @@ def train():
 
             global_step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
+            pbar.update(1)
 
+        pbar.close()
         scheduler.step()
 
-        # Save/validate every 5 epochs (as before)
-        if (epoch + 1) % SAVE_EVERY_EPOCHS == 0:
-            if (epoch + 1) % VALIDATE_EVERY_EPOCHS == 0:
-                validate_encoder(encoder, val_loader, epoch + 1)
+        epoch_num = epoch + 1
 
-            enc_path = os.path.join(MODEL_DIR, f"encoder_mixed_ep{epoch+1}.pth")
+        # Save/validate cadence (default: every 5 epochs)
+        if CFG.save_every_epochs > 0 and (epoch_num % CFG.save_every_epochs == 0):
+            if CFG.validate_every_epochs > 0 and (epoch_num % CFG.validate_every_epochs == 0):
+                validate_encoder(encoder, projector, val_loader, epoch_num)
+
+            enc_path = os.path.join(CFG.model_dir, f"encoder_mixed_ep{epoch_num}.pth")
             torch.save(encoder.state_dict(), enc_path)
 
-            ckpt_path = os.path.join(MODEL_DIR, f"encoder_mixed_ckpt_ep{epoch+1}.pt")
-            save_full_ckpt(ckpt_path, epoch + 1, global_step, encoder, projector, optimizer, scheduler, scaler)
+            ckpt_path = os.path.join(CFG.model_dir, f"encoder_mixed_ckpt_ep{epoch_num}.pt")
+            save_full_ckpt(ckpt_path, epoch_num, global_step, encoder, projector, optimizer, scheduler, scaler)
 
-    torch.save(encoder.state_dict(), os.path.join(MODEL_DIR, "encoder_mixed_final.pth"))
+            # Optional pruning to avoid folder bloat
+            if CFG.max_epoch_ckpts > 0:
+                _prune_old(os.path.join(CFG.model_dir, "encoder_mixed_ep*.pth"), CFG.max_epoch_ckpts)
+                _prune_old(os.path.join(CFG.model_dir, "encoder_mixed_ckpt_ep*.pt"), CFG.max_epoch_ckpts)
+
+    # Final save
+    torch.save(encoder.state_dict(), os.path.join(CFG.model_dir, "encoder_mixed_final.pth"))
+    save_full_ckpt(
+        os.path.join(CFG.model_dir, "encoder_mixed_ckpt_final.pt"),
+        CFG.epochs,
+        global_step,
+        encoder,
+        projector,
+        optimizer,
+        scheduler,
+        scaler,
+    )
 
 
 if __name__ == "__main__":
