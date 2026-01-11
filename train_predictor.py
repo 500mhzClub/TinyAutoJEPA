@@ -21,20 +21,22 @@ PRED_HORIZON = 15
 SEQUENCE_LEN = PRED_HORIZON + 1 
 ENCODER_PATH = "./models/encoder_mixed_final.pth" 
 
-NUM_WORKERS = 8
 
+NUM_WORKERS = 8
 MAX_SEQS_PER_WORKER = 20000 
 
 class ShardedSeqDataset(IterableDataset):
     def __init__(self):
-        self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz") + glob.glob("./data/*.npz"))
+        self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz"))
+        
         self.total_seqs = 0
         self.epoch = 0 # Track epoch for shuffling
         
-        print(f"Predictor Training Setup")
+        print(f"--- Predictor Training Setup ---")
+        print(f"Sources: Race (Expert) + Recovery (Correction)")
         print(f"Scanning {len(self.files)} files for sequence counts...")
         
-        # quick scan
+        # quick scan to count total sequences for progress bar
         for f in tqdm(self.files):
             try:
                 with np.load(f, mmap_mode='r') as d:
@@ -45,7 +47,7 @@ class ShardedSeqDataset(IterableDataset):
                         self.total_seqs += (n - SEQUENCE_LEN)
             except: pass
             
-        print(f"Total Sequences Available: {self.total_seqs:,}")
+        print(f"✅ Total Sequences Available: {self.total_seqs:,}")
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -59,18 +61,17 @@ class ShardedSeqDataset(IterableDataset):
             worker_id = 0
             num_workers = 1
         
-        # 1. Deterministic Shuffling based on Epoch
-        # This ensures every epoch sees data in a different order
+        # Deterministic Shuffling based on Epoch
+        # This ensures every epoch sees data in a different order, avoiding "static batch" overfitting.
         rng = random.Random(self.epoch + worker_id + 1337)
         
-        # Partition files
+        # Partition files across workers
         my_files = self.files[worker_id::num_workers]
-        rng.shuffle(my_files) # Shuffle files for this worker
+        rng.shuffle(my_files) 
         
         sequences_buffer = []
         
         for f in my_files:
-            # Stop loading if buffer is full to preserve RAM
             if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: 
                 break
                 
@@ -87,7 +88,7 @@ class ShardedSeqDataset(IterableDataset):
                 length = len(obs_raw)
                 if length < SEQUENCE_LEN: continue
 
-                # Resize if necessary (vectorized)
+                # Resize if necessary (vectorized for speed)
                 if obs_raw.shape[1] != 64:
                     obs_raw = np.array([cv2.resize(img, (64, 64)) for img in obs_raw])
 
@@ -102,21 +103,19 @@ class ShardedSeqDataset(IterableDataset):
                     
                     sequences_buffer.append((o_chunk, a_chunk))
             except Exception as e: 
-                # print(f"Error loading {f}: {e}")
                 pass
             
-        # Shuffle the buffer so we don't get highly correlated sequences (consecutive frames) in one batch
+        #STREAM PHASE
+        # Shuffle buffer to break temporal correlation between consecutive batches
         rng.shuffle(sequences_buffer)
         
         for o_chunk, a_chunk in sequences_buffer:
-            # Normalize and Permute here (Yield time)
             obs_seq = torch.from_numpy(o_chunk).float() / 255.0
             obs_seq = obs_seq.permute(0, 3, 1, 2) # T, C, H, W
             act_seq = torch.from_numpy(a_chunk).float()
             yield obs_seq, act_seq
             
     def __len__(self): 
-        # Approximate length (since workers might drop data due to buffer limit)
         return self.total_seqs
 
 @torch.no_grad()
@@ -127,7 +126,7 @@ def validate(encoder, predictor, val_loader):
     total_loss = 0
     steps = 0
     
-    # Check just 50 batches to save time
+    # Validate on a small subset (50 batches) to save time
     for i, (obs_seq, act_seq) in enumerate(val_loader):
         if i > 50: break
         
@@ -142,7 +141,7 @@ def validate(encoder, predictor, val_loader):
         loss = 0
         z_current = z_seq[:, 0, :]
         
-        # PURE AUTOREGRESSIVE (Hard mode)
+        # PURE AUTOREGRESSIVE Validation (No help from ground truth)
         for t in range(PRED_HORIZON):
             action = act_seq[:, t, :]
             z_target = z_seq[:, t+1, :]
@@ -150,7 +149,7 @@ def validate(encoder, predictor, val_loader):
             z_next_pred = predictor(z_current, action)
             loss += nn.MSELoss()(z_next_pred, z_target)
             
-            # In validation, always use own prediction
+            # Always use own prediction
             z_current = z_next_pred
             
         total_loss += (loss.item() / PRED_HORIZON)
@@ -159,17 +158,18 @@ def validate(encoder, predictor, val_loader):
     avg_loss = total_loss / steps if steps > 0 else 0
     print(f"  >>> Validation Loss (Autoregressive): {avg_loss:.6f}")
     
-    encoder.eval() # Keep encoder frozen
-    predictor.train() # Reset predictor to train mode
+    encoder.eval() 
+    predictor.train() 
     return avg_loss
 
 def train():
     print(f"Training Predictor on {DEVICE}")
     
     if not os.path.exists(ENCODER_PATH):
-        raise FileNotFoundError("Encoder not found! Run train_encoder.py first.")
+        raise FileNotFoundError(f"Encoder not found at {ENCODER_PATH}! Run train_encoder.py first.")
 
-    #Setup Encoder -Frozen
+    #Setup Frozen Encoder
+    print("Loading Encoder...")
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
@@ -181,21 +181,20 @@ def train():
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
-    #Data
+    # Data
     dataset = ShardedSeqDataset()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     
-    # Training Loop
+    #Training Loop
     os.makedirs("models", exist_ok=True)
-    # Estimate steps per epoch
     steps_per_epoch = len(dataset) // BATCH_SIZE 
 
     for epoch in range(EPOCHS):
-        dataset.set_epoch(epoch) # Update shuffling seed
+        dataset.set_epoch(epoch) # Critical for shuffling
         predictor.train()
         
-        # Curriculum Learning: Teacher Forcing Ratio
-        # Epoch 0: 1.0 (Always use Ground Truth) -> Epoch 40: 0.0 (Always use Prediction)
+        # Curriculum Learning: Decay Teacher Forcing from 1.0 -> 0.0
+        # This helps the model learn initial dynamics before being forced to fly solo.
         tf_ratio = max(0.0, 1.0 - (epoch / (EPOCHS * 0.8))) 
         
         pbar = tqdm(dataloader, total=steps_per_epoch, desc=f"Ep {epoch+1} (TF={tf_ratio:.2f})")
@@ -207,8 +206,6 @@ def train():
             act_seq = act_seq.to(DEVICE, non_blocking=True)
             
             B, T_plus_1, C, H, W = obs_seq.shape
-            
-            # Flatten to encode all frames at once
             obs_flat = obs_seq.view(-1, C, H, W)
 
             optimizer.zero_grad()
@@ -222,21 +219,19 @@ def train():
                 z_current = z_seq[:, 0, :] 
                 
                 for t in range(PRED_HORIZON):
-                    action = act_seq[:, t, :]    # Action taken at step t
-                    z_target = z_seq[:, t+1, :]  # Resulting state at t+1
+                    action = act_seq[:, t, :]    
+                    z_target = z_seq[:, t+1, :]  
                     
                     z_next_pred = predictor(z_current, action)
                     loss += criterion(z_next_pred, z_target)
                     
-                    # Teacher Forcing Logic:
-                    # If random < ratio, use Ground Truth (Target) for next step
-                    # Else, use the model's own Prediction
+                    # Teacher Forcing: Randomly decide to use Truth or Prediction for next step
                     if random.random() < tf_ratio:
                         z_current = z_target
                     else:
                         z_current = z_next_pred
                 
-                # Normalize loss by horizon so gradients are stable
+                # Normalize loss by horizon
                 loss = loss / PRED_HORIZON
 
             scaler.scale(loss).backward()
@@ -248,16 +243,15 @@ def train():
             batch_count += 1
             pbar.set_postfix(loss=f"{curr_loss:.6f}")
 
-        # End of Epoch
         if batch_count > 0:
             print(f"Epoch {epoch+1} Avg Train Loss: {epoch_loss/batch_count:.6f}")
 
-        # Checkpoint & Validation
+        # Checkpoint & Validate
         if (epoch+1) % 5 == 0:
             validate(encoder, predictor, dataloader)
-            torch.save(predictor.state_dict(), f"models/predictor_ep{epoch+1}.pth")
+            torch.save(predictor.state_dict(), f"models/predictor_multistep_ep{epoch+1}.pth")
 
-    torch.save(predictor.state_dict(), "models/predictor_final.pth")
+    torch.save(predictor.state_dict(), "models/predictor_multistep_final.pth")
     print("Predictor Training Complete.")
 
 if __name__ == "__main__":
