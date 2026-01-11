@@ -27,7 +27,7 @@ MAX_SEQS_PER_WORKER = 20000
 
 class ShardedSeqDataset(IterableDataset):
     def __init__(self):
-        self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz"))
+        self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz") + glob.glob("./data/*.npz"))
         self.total_seqs = 0
         self.epoch = 0 # Track epoch for shuffling
         
