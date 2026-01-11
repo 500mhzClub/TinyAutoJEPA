@@ -255,9 +255,9 @@ def train():
         # Checkpoint & Validation
         if (epoch+1) % 5 == 0:
             validate(encoder, predictor, dataloader)
-            torch.save(predictor.state_dict(), f"models/predictor_multistep_ep{epoch+1}.pth")
+            torch.save(predictor.state_dict(), f"models/predictor_ep{epoch+1}.pth")
 
-    torch.save(predictor.state_dict(), "models/predictor_multistep_final.pth")
+    torch.save(predictor.state_dict(), "models/predictor_final.pth")
     print("Predictor Training Complete.")
 
 if __name__ == "__main__":

@@ -65,10 +65,10 @@ Heres an example, though features are still sharpening up:
 
 ### Step 4: Multi-Step Predictor Training
 
-Trains the latent dynamics model. Unlike previous iterations, this uses a **Multi-Step Horizon (T+5)**. The model must predict a chain reaction of 5 future states. This forces it to learn causal physics rather than just copying the previous frame.
+Trains the latent dynamics model. Unlike previous iterations, this uses a **Multi-Step Horizon (T+15)**. The model must predict a chain reaction of 15 future states. This forces it to learn causal physics rather than just copying the previous frame.
 
 ```bash
-python train_predictor_multistep.py
+python train_predictor.py
 
 ```
 Initial Dream visualisation, predictor generating possible futures: 
@@ -98,7 +98,7 @@ The architecture is a modified **ResNet18** backbone. Max-pooling layers have be
 ### 2. The Multi-Step Predictor (`Predictor`)
 
 **Layman Explanation:**
-The Predictor functions as the system's internal simulator. It takes the current state summary and a proposed sequence of actions (e.g., "accelerate, then steer left") to calculate the likely outcome 5 steps into the future.
+The Predictor functions as the system's internal simulator. It takes the current state summary and a proposed sequence of actions (e.g., "accelerate, then steer left") to calculate the likely outcome 15 steps into the future.
 
 **Technical Detail:**
 This is an autoregressive Multi-Layer Perceptron (MLP).
