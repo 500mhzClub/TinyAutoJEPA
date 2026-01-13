@@ -25,9 +25,10 @@ class CFG:
     weight_decay: float = float(os.getenv("WEIGHT_DECAY", "0.05"))
     
     # DataLoader
+    # With mmap, we can safely use persistent workers and prefetch without OOM
     num_workers: int = int(os.getenv("NUM_WORKERS", "8"))
     prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "2"))
-    persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "0") == "1"
+    persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "1") == "1"
     
     # Dataset dirs
     data_random: str = os.getenv("DATA_RANDOM", "./data")
@@ -37,7 +38,6 @@ class CFG:
     
     # Saving/validation cadence
     model_dir: str = os.getenv("MODEL_DIR", "./models")
-    # [CHANGED] Default changed from "5" to "1" to save every epoch
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
     max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  
@@ -64,7 +64,7 @@ def seed_everything(seed: int) -> None:
 def worker_init_fn(worker_id: int) -> None:
     cv2.setNumThreads(0)
     cv2.ocl.setUseOpenCL(False)
-
+    # Different seed per worker
     s = CFG.seed + worker_id
     random.seed(s)
     np.random.seed(s)
@@ -82,19 +82,18 @@ class RunningAverage:
         self.count += n
         self.avg = self.sum / self.count
 
-# Dataset
-def _list_npz(dir_path: str) -> List[str]:
+# Dataset Helpers
+def _list_npy(dir_path: str) -> List[str]:
     if not dir_path:
         return []
-    return sorted(glob.glob(os.path.join(dir_path, "*.npz")))
+    # Search for .npy files (converted from .npz)
+    return sorted(glob.glob(os.path.join(dir_path, "*.npy")))
 
-def _count_frames_npz(path: str) -> int:
+def _count_frames_npy(path: str) -> int:
     try:
-        with np.load(path, mmap_mode="r", allow_pickle=False) as d:
-            if "states" in d:
-                return int(d["states"].shape[0])
-            if "obs" in d:
-                return int(d["obs"].shape[0])
+        # mmap_mode="r" reads header only, practically instant
+        d = np.load(path, mmap_mode="r")
+        return int(d.shape[0])
     except Exception:
         pass
     return 0
@@ -102,13 +101,16 @@ def _count_frames_npz(path: str) -> int:
 class BalancedMixedDataset(IterableDataset):
     def __init__(self):
         super().__init__()
-        self.random_files = _list_npz(CFG.data_random)
-        self.race_files = _list_npz(CFG.data_race)
-        self.recovery_files = _list_npz(CFG.data_recovery)
-        self.edge_files = _list_npz(CFG.data_edge)
+        self.random_files = _list_npy(CFG.data_random)
+        self.race_files = _list_npy(CFG.data_race)
+        self.recovery_files = _list_npy(CFG.data_recovery)
+        self.edge_files = _list_npy(CFG.data_edge)
 
         if not (self.random_files or self.race_files or self.recovery_files or self.edge_files):
-            raise RuntimeError("No .npz files found in any data directories.")
+            raise RuntimeError(
+                "No .npy files found in any data directories. "
+                "Did you run the conversion script to unpack .npz -> .npy?"
+            )
 
         max_files = max(
             len(self.random_files),
@@ -132,7 +134,7 @@ class BalancedMixedDataset(IterableDataset):
         
         self.total_frames = 0
         for f in tqdm(self.balanced_files, desc="Scanning Dataset"):
-            self.total_frames += _count_frames_npz(f)
+            self.total_frames += _count_frames_npy(f)
         print(f"Total Frames: {self.total_frames:,}")
 
         self.epoch = 0
@@ -154,22 +156,28 @@ class BalancedMixedDataset(IterableDataset):
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
         
+        # Unique seed per worker/epoch combination to ensure variation
         current_seed = CFG.seed + worker_id + (self.epoch * 10000)
         
         rng = random.Random(current_seed)
         np_rng = np.random.default_rng(current_seed)
         torch.manual_seed(current_seed)
         
+        # Shard files across workers
         my_files = self.balanced_files[worker_id::num_workers]
         my_files = list(my_files)
         
+        # Shuffle file order
         rng.shuffle(my_files)
         
         for f in my_files:
             try:
-                with np.load(f, allow_pickle=False) as data:
-                    raw = data["states"] if "states" in data else data["obs"]
+                # MMAP MODE: Creates a virtual array on disk.
+                # No data is loaded into RAM until specific indices are accessed.
+                raw = np.load(f, mmap_mode="r")
                 
+                # We shuffle indices, but we access the disk randomly.
+                # The OS Page Cache handles the buffering.
                 idxs = np_rng.permutation(len(raw))
                 
                 for idx in idxs:
@@ -182,16 +190,10 @@ class BalancedMixedDataset(IterableDataset):
                     img = img.permute(2, 0, 1)
                     yield self.transform(img), self.transform(img)
                 
-                del raw
+                # No explicit 'del' needed; Python closes file handle automatically
 
             except Exception:
                 continue
-        
-        if sys.platform == "linux":
-            try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
 
     def __len__(self):
         return self.total_frames
@@ -309,12 +311,6 @@ def train() -> None:
     os.makedirs(CFG.model_dir, exist_ok=True)
     seed_everything(CFG.seed)
 
-    if CFG.persistent_workers:
-        raise RuntimeError(
-            "PERSISTENT_WORKERS=1 is not supported with this epoch-based shuffling logic. "
-            "Please set PERSISTENT_WORKERS=0 in your environment."
-        )
-
     print(f"torch={torch.__version__} hip={getattr(torch.version, 'hip', None)}")
     if torch.cuda.is_available():
         print(f"visible_devices={torch.cuda.device_count()}")
@@ -329,10 +325,10 @@ def train() -> None:
         num_workers=CFG.num_workers,
         pin_memory=(DEVICE.type == "cuda"),
         worker_init_fn=worker_init_fn if CFG.num_workers > 0 else None,
+        persistent_workers=CFG.persistent_workers if CFG.num_workers > 0 else False,
     )
     if CFG.num_workers > 0:
         dl_kwargs["prefetch_factor"] = CFG.prefetch_factor
-        dl_kwargs["persistent_workers"] = False # Enforce disabled
         
     dataloader = DataLoader(dataset, **dl_kwargs)
     
@@ -384,6 +380,7 @@ def train() -> None:
     projector.train()
 
     for epoch in range(start_epoch, CFG.epochs):
+        # Update epoch count in dataset for RNG mixing
         dataset.set_epoch(epoch)
         
         if epoch == start_epoch:
