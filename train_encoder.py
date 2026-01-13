@@ -17,9 +17,6 @@ from tqdm import tqdm
 from networks import TinyEncoder, Projector
 from vicreg import vicreg_loss
 
-# ----------------------------
-# Config (env-overridable)
-# ----------------------------
 @dataclass
 class CFG:
     batch_size: int = int(os.getenv("BATCH_SIZE", "128"))
@@ -42,7 +39,7 @@ class CFG:
     model_dir: str = os.getenv("MODEL_DIR", "./models")
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
-    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  # prune old ckpts/weights (0 = keep all)
+    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  
     
     # Resume
     resume: bool = os.getenv("RESUME", "1") == "1"
