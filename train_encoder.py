@@ -3,6 +3,8 @@ import re
 import glob
 import math
 import random
+import sys
+import ctypes
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import cv2
@@ -20,7 +22,6 @@ from vicreg import vicreg_loss
 # ----------------------------
 @dataclass
 class CFG:
-    # Training defaults match your old script
     batch_size: int = int(os.getenv("BATCH_SIZE", "128"))
     epochs: int = int(os.getenv("EPOCHS", "30"))
     lr: float = float(os.getenv("LR", "3e-4"))
@@ -37,25 +38,19 @@ class CFG:
     data_recovery: str = os.getenv("DATA_RECOVERY", "./data_recovery")
     data_edge: str = os.getenv("DATA_EDGE", "./data_edge")
     
-    # Saving / validation cadence (old behaviour: every 5 epochs)
+    # Saving/validation cadence
     model_dir: str = os.getenv("MODEL_DIR", "./models")
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
     max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  # prune old ckpts/weights (0 = keep all)
     
-    # Resume / warm-start
+    # Resume
     resume: bool = os.getenv("RESUME", "1") == "1"
     resume_full_if_avail: bool = os.getenv("RESUME_FULL_IF_AVAIL", "1") == "1"
     warm_start_encoder: str = os.getenv("WARM_START_ENCODER", "")  # path to .pth encoder weights (fresh opt/sched)
-    
-    # Validation tuning
     val_num_batches: int = int(os.getenv("VAL_NUM_BATCHES", "20"))
     dead_std_thr: float = float(os.getenv("DEAD_STD_THR", "0.01"))
-    
-    # Repro
     seed: int = int(os.getenv("SEED", "1337"))
-    
-    # Device
     device: str = os.getenv("DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
 
 CFG = CFG()
@@ -69,15 +64,16 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 def worker_init_fn(worker_id: int) -> None:
-    # Initial seed for the worker process itself.
+
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+
     s = CFG.seed + worker_id
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
 
-# ----------------------------
-# Helper: Running Average
-# ----------------------------
+# Running Average
 class RunningAverage:
     def __init__(self):
         self.sum = 0.0
@@ -89,20 +85,22 @@ class RunningAverage:
         self.count += n
         self.avg = self.sum / self.count
 
-# ----------------------------
 # Dataset
-# ----------------------------
 def _list_npz(dir_path: str) -> List[str]:
     if not dir_path:
         return []
     return sorted(glob.glob(os.path.join(dir_path, "*.npz")))
 
 def _count_frames_npz(path: str) -> int:
-    with np.load(path, mmap_mode="r", allow_pickle=False) as d:
-        if "states" in d:
-            return int(d["states"].shape[0])
-        if "obs" in d:
-            return int(d["obs"].shape[0])
+    try:
+        # mmap_mode='r' avoids loading data just to check shape
+        with np.load(path, mmap_mode="r", allow_pickle=False) as d:
+            if "states" in d:
+                return int(d["states"].shape[0])
+            if "obs" in d:
+                return int(d["obs"].shape[0])
+    except Exception:
+        pass
     return 0
 
 class BalancedMixedDataset(IterableDataset):
@@ -141,14 +139,11 @@ class BalancedMixedDataset(IterableDataset):
         print(f"Balanced Dataset: {len(self.balanced_files)} files.")
         
         self.total_frames = 0
+        # Fast scan
         for f in tqdm(self.balanced_files, desc="Scanning Dataset"):
-            try:
-                self.total_frames += _count_frames_npz(f)
-            except Exception:
-                pass
+            self.total_frames += _count_frames_npz(f)
         print(f"Total Frames: {self.total_frames:,}")
 
-        # [FIX] Track epoch to ensure shuffling changes over time
         self.epoch = 0
 
         self.transform = transforms.Compose([
@@ -163,16 +158,16 @@ class BalancedMixedDataset(IterableDataset):
         self.epoch = epoch
 
     def __iter__(self):
+        cv2.setNumThreads(0)
+        
         info = get_worker_info()
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
         
         current_seed = CFG.seed + worker_id + (self.epoch * 10000)
         
-        # 1. Seed Python RNG (for shuffling file list)
         rng = random.Random(current_seed)
         
-        # 2. Seed Numpy RNG (for shuffling frames within file)
         np_rng = np.random.default_rng(current_seed)
 
         torch.manual_seed(current_seed)
@@ -180,7 +175,6 @@ class BalancedMixedDataset(IterableDataset):
         my_files = self.balanced_files[worker_id::num_workers]
         my_files = list(my_files)
         
-        # Shuffle files (differs every epoch due to seed)
         rng.shuffle(my_files)
         
         for f in my_files:
@@ -188,27 +182,36 @@ class BalancedMixedDataset(IterableDataset):
                 with np.load(f, allow_pickle=False) as data:
                     raw = data["states"] if "states" in data else data["obs"]
                 
-                if raw.shape[1] != 64 or raw.shape[2] != 64:
-                    raw = np.array(
-                        [cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA) for img in raw],
-                        dtype=raw.dtype,
-                    )
-                
-                # Shuffle frames (differs every epoch due to seed)
+                # Shuffle frames
                 idxs = np_rng.permutation(len(raw))
+                
                 for idx in idxs:
-                    img = torch.from_numpy(raw[idx]).float().div_(255.0)  # [H,W,C]
+                    img_np = raw[idx] # Grab single frame
+                    
+                    # Lazy Resize: Only resize this specific frame if needed
+                    if img_np.shape[0] != 64 or img_np.shape[1] != 64:
+                        img_np = cv2.resize(img_np, (64, 64), interpolation=cv2.INTER_AREA)
+
+                    img = torch.from_numpy(img_np).float().div_(255.0)  # [H,W,C]
                     img = img.permute(2, 0, 1)  # [C,H,W]
                     yield self.transform(img), self.transform(img)
+                
+                # [OPTIMIZATION] Explicit delete to help GC
+                del raw
+
             except Exception:
                 continue
+        
+        if sys.platform == "linux":
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
     def __len__(self):
         return self.total_frames
 
-# ----------------------------
-# Validation (scale-aware)
-# ----------------------------
+# Validation
 @torch.no_grad()
 def validate_encoder(encoder, projector, val_loader, epoch: int) -> None:
     encoder.eval()
@@ -262,9 +265,7 @@ def validate_encoder(encoder, projector, val_loader, epoch: int) -> None:
     encoder.train()
     projector.train()
 
-# ----------------------------
 # Checkpoint helpers
-# ----------------------------
 def _epoch_from_name(path: str) -> int:
     m = re.search(r"ep(\d+)", os.path.basename(path))
     return int(m.group(1)) if m else -1
@@ -318,9 +319,7 @@ def _prune_old(pattern: str, keep: int) -> None:
         except Exception:
             pass
 
-# ----------------------------
 # Train
-# ----------------------------
 def train() -> None:
     os.makedirs(CFG.model_dir, exist_ok=True)
     seed_everything(CFG.seed)
@@ -432,13 +431,11 @@ def train() -> None:
                 loss.backward()
                 optimizer.step()
             
-            # [FIX] Weight the average by batch size for mathematical correctness
             loss_val = loss.item()
             loss_avg.update(loss_val, n=x1.size(0))
             
             global_step += 1
             
-            # Show the AVERAGE loss in the progress bar
             pbar.set_postfix(loss=f"{loss_avg.avg:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
             pbar.update(1)
             
