@@ -25,9 +25,9 @@ class CFG:
     weight_decay: float = float(os.getenv("WEIGHT_DECAY", "0.05"))
     
     # DataLoader
-    # With mmap, we can safely use persistent workers and prefetch without OOM
     num_workers: int = int(os.getenv("NUM_WORKERS", "8"))
     prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "2"))
+    # We can safely use persistent workers now because memory footprint is low
     persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "1") == "1"
     
     # Dataset dirs
@@ -186,7 +186,11 @@ class BalancedMixedDataset(IterableDataset):
                     if img_np.shape[0] != 64 or img_np.shape[1] != 64:
                         img_np = cv2.resize(img_np, (64, 64), interpolation=cv2.INTER_AREA)
 
-                    img = torch.from_numpy(img_np).float().div_(255.0)
+                    # [FIXED] Force a copy here to detach from the read-only mmap buffer.
+                    # This prevents the "UserWarning: The given NumPy array is not writable" error.
+                    img_copy = np.array(img_np, copy=True)
+                    
+                    img = torch.from_numpy(img_copy).float().div_(255.0)
                     img = img.permute(2, 0, 1)
                     yield self.transform(img), self.transform(img)
                 
