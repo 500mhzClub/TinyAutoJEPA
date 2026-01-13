@@ -37,14 +37,15 @@ class CFG:
     
     # Saving/validation cadence
     model_dir: str = os.getenv("MODEL_DIR", "./models")
-    save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "5"))
+    # [CHANGED] Default changed from "5" to "1" to save every epoch
+    save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
     max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  
     
     # Resume
     resume: bool = os.getenv("RESUME", "1") == "1"
     resume_full_if_avail: bool = os.getenv("RESUME_FULL_IF_AVAIL", "1") == "1"
-    warm_start_encoder: str = os.getenv("WARM_START_ENCODER", "")  # path to .pth encoder weights (fresh opt/sched)
+    warm_start_encoder: str = os.getenv("WARM_START_ENCODER", "")
     val_num_batches: int = int(os.getenv("VAL_NUM_BATCHES", "20"))
     dead_std_thr: float = float(os.getenv("DEAD_STD_THR", "0.01"))
     seed: int = int(os.getenv("SEED", "1337"))
@@ -61,7 +62,6 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 def worker_init_fn(worker_id: int) -> None:
-
     cv2.setNumThreads(0)
     cv2.ocl.setUseOpenCL(False)
 
@@ -90,7 +90,6 @@ def _list_npz(dir_path: str) -> List[str]:
 
 def _count_frames_npz(path: str) -> int:
     try:
-        # mmap_mode='r' avoids loading data just to check shape
         with np.load(path, mmap_mode="r", allow_pickle=False) as d:
             if "states" in d:
                 return int(d["states"].shape[0])
@@ -101,10 +100,6 @@ def _count_frames_npz(path: str) -> int:
     return 0
 
 class BalancedMixedDataset(IterableDataset):
-    """
-    Balanced 4-way mix (random/race/recovery/edge) by file count.
-    Yields (aug(img), aug(img)) for VICReg.
-    """
     def __init__(self):
         super().__init__()
         self.random_files = _list_npz(CFG.data_random)
@@ -136,7 +131,6 @@ class BalancedMixedDataset(IterableDataset):
         print(f"Balanced Dataset: {len(self.balanced_files)} files.")
         
         self.total_frames = 0
-        # Fast scan
         for f in tqdm(self.balanced_files, desc="Scanning Dataset"):
             self.total_frames += _count_frames_npz(f)
         print(f"Total Frames: {self.total_frames:,}")
@@ -151,7 +145,6 @@ class BalancedMixedDataset(IterableDataset):
         ])
 
     def set_epoch(self, epoch: int):
-        """Update the current epoch so the next iterator uses a fresh seed."""
         self.epoch = epoch
 
     def __iter__(self):
@@ -164,9 +157,7 @@ class BalancedMixedDataset(IterableDataset):
         current_seed = CFG.seed + worker_id + (self.epoch * 10000)
         
         rng = random.Random(current_seed)
-        
         np_rng = np.random.default_rng(current_seed)
-
         torch.manual_seed(current_seed)
         
         my_files = self.balanced_files[worker_id::num_workers]
@@ -179,21 +170,18 @@ class BalancedMixedDataset(IterableDataset):
                 with np.load(f, allow_pickle=False) as data:
                     raw = data["states"] if "states" in data else data["obs"]
                 
-                # Shuffle frames
                 idxs = np_rng.permutation(len(raw))
                 
                 for idx in idxs:
-                    img_np = raw[idx] # Grab single frame
+                    img_np = raw[idx]
                     
-                    # Lazy Resize: Only resize this specific frame if needed
                     if img_np.shape[0] != 64 or img_np.shape[1] != 64:
                         img_np = cv2.resize(img_np, (64, 64), interpolation=cv2.INTER_AREA)
 
-                    img = torch.from_numpy(img_np).float().div_(255.0)  # [H,W,C]
-                    img = img.permute(2, 0, 1)  # [C,H,W]
+                    img = torch.from_numpy(img_np).float().div_(255.0)
+                    img = img.permute(2, 0, 1)
                     yield self.transform(img), self.transform(img)
                 
-                # [OPTIMIZATION] Explicit delete to help GC
                 del raw
 
             except Exception:
