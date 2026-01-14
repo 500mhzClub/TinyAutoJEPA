@@ -10,7 +10,7 @@ This project is configured for a high-performance AMD workstation running Linux.
 
 | Component | Specification | Function |
 | --- | --- | --- |
-| **CPU** | **AMD Ryzen 9 5950X** (16C/32T) | Handles massive parallel data generation and loading. Runs 32 concurrent Gym environments during data collection and manages dataset shuffling for the 1.9M frame buffer. |
+| **CPU** | **AMD Ryzen 9 5950X** (16C/32T) | Handles massive parallel data generation and loading. Runs 32 concurrent Gym environments during data collection and manages dataset shuffling for the ~5.8 million frame buffer. |
 | **GPU 1** | **AMD Radeon RX 6950 XT** (16GB) | Primary compute unit. Dedicated to training the **Encoder**, **Predictor**, and **Cost Model**. Leverages ROCm mixed-precision (`torch.amp`) to handle large batch sizes (256) and VICReg loss calculations. |
 | **GPU 2** | **9060 XT** | Secondary compute unit. Runs the **Parallel Decoder** in the background. It dynamically loads checkpoints from GPU 1 to visualize the latent space in real time without pausing the main training loop. |
 | **RAM** | **64 GB DDR4** | Facilitates OS-level caching of the dataset, minimizing disk I/O latency during repeated training epochs. |
