@@ -1,280 +1,333 @@
+
 import gymnasium as gym
 import numpy as np
 import multiprocessing as mp
 import os
 import cv2
-import math
 import time
+import warnings
+from typing import Optional, Tuple
 
 # --- CONFIGURATION ---
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "32"))
-EPISODES_PER_WORKER = int(os.getenv("EPISODES_PER_WORKER", "50"))
-MAX_STEPS = int(os.getenv("MAX_STEPS", "1000"))
-DATA_DIR = os.getenv("DATA_DIR", "data_race")
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", str(min(32, mp.cpu_count()))))
+EPISODES_PER_WORKER = int(os.getenv("EPISODES_PER_WORKER", "80"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "600"))
+
+DATA_DIR = os.getenv("DATA_DIR", "data_raceline")
 IMG_SIZE = int(os.getenv("IMG_SIZE", "64"))
+CHUNK_FRAMES = int(os.getenv("CHUNK_FRAMES", "20000"))  # flush periodically to avoid huge RAM
 
-# --- Controller tuning (safer defaults) ---
-BASE_LOOKAHEAD = float(os.getenv("BASE_LOOKAHEAD", "10.0"))
-LOOKAHEAD_SPEED = float(os.getenv("LOOKAHEAD_SPEED", "0.20"))
+# Pure Pursuit / controller tuning
+LOOKAHEAD_BASE = float(os.getenv("LOOKAHEAD_BASE", "10.0"))   # base lookahead in "track points"
+LOOKAHEAD_GAIN = float(os.getenv("LOOKAHEAD_GAIN", "1.2"))    # additional lookahead per m/s
+STEER_GAIN = float(os.getenv("STEER_GAIN", "1.2"))            # overall steering gain
 
-STANLEY_K = float(os.getenv("STANLEY_K", "0.7"))
-HEADING_GAIN = float(os.getenv("HEADING_GAIN", "1.0"))
-
-V_MAX = float(os.getenv("V_MAX", "35.0"))
-V_MIN = float(os.getenv("V_MIN", "10.0"))
-CURVATURE_SLOWDOWN = float(os.getenv("CURVATURE_SLOWDOWN", "20.0"))
-
-GAS_MAX = float(os.getenv("GAS_MAX", "0.65"))
-BRAKE_MAX = float(os.getenv("BRAKE_MAX", "0.55"))
-
-# Off-road detection hysteresis
-OFFROAD_GRACE_STEPS = int(os.getenv("OFFROAD_GRACE_STEPS", "60"))
-OFFROAD_STREAK_KILL = int(os.getenv("OFFROAD_STREAK_KILL", "25"))
-
-# Segment acceptance
-MIN_FRAMES_TO_KEEP = int(os.getenv("MIN_FRAMES_TO_KEEP", "120"))
-
-# Steering rate limit (per-step)
-MAX_STEER_DELTA = float(os.getenv("MAX_STEER_DELTA", "0.12"))
-
+# Speed control (units are Box2D-ish; treat as relative tuning)
+V_MAX = float(os.getenv("V_MAX", "32.0"))     # top target speed on straights
+V_MIN = float(os.getenv("V_MIN", "12.0"))     # minimum target speed for sharp turns
+CURV_GAIN = float(os.getenv("CURV_GAIN", "55.0"))  # how aggressively curvature lowers speed
+BRAKE_GAIN = float(os.getenv("BRAKE_GAIN", "0.8"))  # brake strength when overspeed
+GAS_GAIN = float(os.getenv("GAS_GAIN", "0.045"))    # throttle proportional gain
 
 def process_frame(frame: np.ndarray) -> np.ndarray:
     if frame is None:
         return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+    # CarRacing obs is ~96x96; crop top HUD-ish area a bit (keeps road + horizon)
     frame = frame[:84, :, :]
     frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return frame.astype(np.uint8)
 
-
 def _wrap_idx(i: int, n: int) -> int:
+    # Always returns 0..n-1
     return int(i % n)
 
-
-def _angle_wrap(a: float) -> float:
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _track_half_width(u) -> float:
+def _extract_track_xy(track_item) -> Optional[Tuple[float, float]]:
     """
-    Gym CarRacing uses TRACK_WIDTH as HALF road width in world units (used with +/- normal offsets).
-    If not present, fall back to a conservative guess.
+    Gymnasium CarRacing track items have varied formats across forks/versions.
+    Common legacy format: (alpha, beta, x, y)
+    We attempt to robustly extract (x,y).
     """
-    for name in ("TRACK_WIDTH", "track_width", "ROAD_WIDTH", "road_width"):
-        v = getattr(u, name, None)
-        if isinstance(v, (int, float)) and v > 0:
-            # If someone exposed ROAD_WIDTH as full width, we still treat as half-width
-            # only when it looks like the classic TRACK_WIDTH scale. Heuristic:
-            vv = float(v)
-            if name.lower().endswith("width") and vv > 12.0:
-                return vv * 0.5
-            return vv
-    return 7.0  # conservative half-width fallback
+    if track_item is None:
+        return None
 
+    # If it's a dict-like
+    if isinstance(track_item, dict):
+        if "x" in track_item and "y" in track_item:
+            return float(track_item["x"]), float(track_item["y"])
+        return None
 
-def _closest_idx(track_xy: np.ndarray, car_pos: np.ndarray, prev_idx: int | None) -> int:
-    n = int(len(track_xy))
+    # If it's a tuple/list
+    if isinstance(track_item, (tuple, list)):
+        L = len(track_item)
+        if L == 4:
+            # (alpha, beta, x, y) is the most common
+            x, y = track_item[2], track_item[3]
+            return float(x), float(y)
+        if L == 3:
+            a, b, c = track_item[0], track_item[1], track_item[2]
+            # Heuristic: angles are ~[-pi, pi], coordinates are typically much larger magnitude.
+            def is_angle(v: float) -> bool:
+                return abs(float(v)) <= 3.6
+
+            # (x, y, angle)
+            if (not is_angle(a)) and (not is_angle(b)) and is_angle(c):
+                return float(a), float(b)
+            # (angle, x, y)
+            if is_angle(a) and (not is_angle(b)) and (not is_angle(c)):
+                return float(b), float(c)
+            # (x, angle, y) or other weirdness: pick the two least angle-like
+            vals = [float(a), float(b), float(c)]
+            angle_flags = [is_angle(v) for v in vals]
+            xy = [v for v, is_a in zip(vals, angle_flags) if not is_a]
+            if len(xy) >= 2:
+                return xy[0], xy[1]
+            return None
+        # If longer, try last two as x,y
+        if L >= 2:
+            x, y = track_item[-2], track_item[-1]
+            try:
+                return float(x), float(y)
+            except Exception:
+                return None
+
+    return None
+
+def get_centerline(env) -> np.ndarray:
+    """
+    Returns Nx2 array of track center points in world coordinates.
+    """
+    track = getattr(env.unwrapped, "track", None)
+    if track is None or len(track) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    pts = []
+    for item in track:
+        xy = _extract_track_xy(item)
+        if xy is not None:
+            pts.append(xy)
+
+    if len(pts) < 10:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    # Remove obvious duplicates (track sometimes repeats points)
+    arr = np.asarray(pts, dtype=np.float32)
+    # Keep points that move at least epsilon
+    keep = [0]
+    eps = 1e-3
+    for i in range(1, len(arr)):
+        if np.linalg.norm(arr[i] - arr[keep[-1]]) > eps:
+            keep.append(i)
+    arr = arr[keep]
+    return arr
+
+def car_state(env) -> Tuple[np.ndarray, float, float]:
+    """
+    Returns (pos_xy, heading_angle, speed).
+    """
+    car = env.unwrapped.car
+    hull = car.hull
+    pos = np.array([hull.position.x, hull.position.y], dtype=np.float32)
+    heading = float(hull.angle)  # radians
+    v = hull.linearVelocity
+    speed = float(np.sqrt(v.x * v.x + v.y * v.y))
+    return pos, heading, speed
+
+def nearest_index(path_xy: np.ndarray, pos_xy: np.ndarray, prev_idx: Optional[int], window: int = 80) -> int:
+    """
+    Windowed nearest-point search around prev_idx for speed.
+    Falls back to global nearest if prev_idx is None.
+    """
+    n = len(path_xy)
     if n == 0:
         return 0
 
     if prev_idx is None:
-        d = np.linalg.norm(track_xy - car_pos[None, :], axis=1)
-        return int(np.argmin(d))
+        d2 = np.sum((path_xy - pos_xy[None, :]) ** 2, axis=1)
+        return int(np.argmin(d2))
 
-    # Bidirectional local search around previous index (handles overshoot / spins)
-    back = 25
-    fwd = 60
-    offsets = np.arange(-back, fwd, dtype=np.int32)
-    idxs = (prev_idx + offsets) % n
-    d = np.linalg.norm(track_xy[idxs] - car_pos[None, :], axis=1)
-    return int(idxs[int(np.argmin(d))])
+    # search in [prev_idx - window, prev_idx + window]
+    idxs = np.arange(prev_idx - window, prev_idx + window + 1)
+    idxs = np.array([_wrap_idx(i, n) for i in idxs], dtype=np.int32)
+    cand = path_xy[idxs]
+    d2 = np.sum((cand - pos_xy[None, :]) ** 2, axis=1)
+    return int(idxs[int(np.argmin(d2))])
 
-
-def _local_path_yaw(track_xy: np.ndarray, idx: int) -> float:
-    n = int(len(track_xy))
-    p0 = track_xy[idx]
-    p1 = track_xy[_wrap_idx(idx + 3, n)]
-    v = p1 - p0
-    if float(np.linalg.norm(v)) < 1e-3:
-        p1 = track_xy[_wrap_idx(idx + 8, n)]
-        v = p1 - p0
-    return math.atan2(float(v[1]), float(v[0]))
-
-
-def _cross_track_error(track_xy: np.ndarray, idx: int, car_pos: np.ndarray) -> tuple[float, float]:
+def curvature_ahead(path_xy: np.ndarray, idx: int, look: int = 18) -> float:
     """
-    Returns (cte_signed, path_yaw) computed at the LOCAL closest waypoint.
+    Simple curvature proxy using turning angle over a short horizon.
+    Returns a nonnegative scalar; higher => tighter turn.
     """
-    path_yaw = _local_path_yaw(track_xy, idx)
-    p0 = track_xy[idx]
-    dx = float(car_pos[0] - p0[0])
-    dy = float(car_pos[1] - p0[1])
-    left_n = np.array([-math.sin(path_yaw), math.cos(path_yaw)], dtype=np.float32)
-    cte = float(dx * left_n[0] + dy * left_n[1])
-    return cte, path_yaw
+    n = len(path_xy)
+    if n < (look + 3):
+        return 0.0
 
+    i0 = _wrap_idx(idx, n)
+    i1 = _wrap_idx(idx + look, n)
+    i2 = _wrap_idx(idx + 2 * look, n)
 
-def expert_controller(env, prev_idx: int | None, prev_steer: float, step_count: int):
+    p0 = path_xy[i0]
+    p1 = path_xy[i1]
+    p2 = path_xy[i2]
+
+    v1 = p1 - p0
+    v2 = p2 - p1
+
+    n1 = np.linalg.norm(v1) + 1e-8
+    n2 = np.linalg.norm(v2) + 1e-8
+
+    v1 /= n1
+    v2 /= n2
+
+    # angle between segments
+    dot = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+    ang = float(np.arccos(dot))  # [0, pi]
+    # normalize by segment length to get a curvature-like proxy
+    return ang / float(look)
+
+def pure_pursuit_steer(pos_xy: np.ndarray, heading: float, target_xy: np.ndarray, steer_gain: float) -> float:
     """
-    Stable pursuit + Stanley-like correction, with geometric offroad detection.
-    Returns: action, new_prev_idx, new_prev_steer, offroad_bool
+    Pure pursuit steering: transform target into car frame and compute curvature.
     """
-    u = env.unwrapped
-    car = getattr(u, "car", None)
-    track = getattr(u, "track", None)
+    # rotation into car frame (car x-axis forward)
+    dx, dy = float(target_xy[0] - pos_xy[0]), float(target_xy[1] - pos_xy[1])
+    ch, sh = float(np.cos(heading)), float(np.sin(heading))
 
-    if car is None or track is None or len(track) == 0:
-        return np.array([0.0, 0.0, 0.0], dtype=np.float32), prev_idx, prev_steer, False
+    # world -> car frame
+    x_car =  ch * dx + sh * dy
+    y_car = -sh * dx + ch * dy
 
-    car_pos = np.array(car.hull.position, dtype=np.float32)
-    car_angle = float(car.hull.angle)
-    car_vel = np.array(car.hull.linearVelocity, dtype=np.float32)
-    speed = float(np.linalg.norm(car_vel))
+    # If target is behind, damp steering to avoid flip
+    if x_car < 1e-3:
+        return 0.0
 
-    track_xy = np.array([t[2:4] for t in track], dtype=np.float32)
-    n = int(len(track_xy))
+    Ld2 = x_car * x_car + y_car * y_car + 1e-8
+    curvature = 2.0 * y_car / Ld2  # signed
+    steer = steer_gain * curvature
+    return float(np.clip(steer, -1.0, 1.0))
 
-    # 1) Closest waypoint (robust local search)
-    closest = _closest_idx(track_xy, car_pos, prev_idx)
+def raceline_controller(path_xy: np.ndarray, env, prev_idx: Optional[int], prev_steer: float) -> Tuple[np.ndarray, int, float]:
+    """
+    Returns (action, new_prev_idx, new_prev_steer)
+    action = [steer, gas, brake]
+    """
+    pos, heading, speed = car_state(env)
 
-    # 2) Lookahead selection by arc distance proxy (Euclidean steps)
-    L = BASE_LOOKAHEAD + LOOKAHEAD_SPEED * min(speed, 40.0)
-    target = closest
-    for i in range(1, 120):
-        j = _wrap_idx(closest + i, n)
-        if float(np.linalg.norm(track_xy[j] - car_pos)) >= L:
-            target = j
-            break
+    if len(path_xy) < 10:
+        # Fallback: drive straight-ish if no path
+        steer = 0.0
+        gas = 0.6
+        brake = 0.0
+        return np.array([steer, gas, brake], dtype=np.float32), 0, float(steer)
 
-    # 3) Heading and CTE computed at LOCAL closest (more reliable for offroad + control)
-    cte, path_yaw = _cross_track_error(track_xy, closest, car_pos)
-    heading_err = _angle_wrap(path_yaw - car_angle)
+    idx = nearest_index(path_xy, pos, prev_idx, window=90)
 
-    # 4) Stanley steering
-    stanley_term = math.atan2(STANLEY_K * cte, max(4.0, speed))
-    raw_steer = HEADING_GAIN * heading_err + stanley_term
-    raw_steer = float(np.clip(raw_steer, -1.0, 1.0))
+    # Speed-adaptive lookahead (in index-steps along discrete centerline points)
+    lookahead = int(np.clip(LOOKAHEAD_BASE + LOOKAHEAD_GAIN * speed, 6.0, 55.0))
+    target_idx = _wrap_idx(idx + lookahead, len(path_xy))
+    target = path_xy[target_idx]
 
-    # 5) Rate-limit steering (real smoothing)
-    steer = float(np.clip(raw_steer, prev_steer - MAX_STEER_DELTA, prev_steer + MAX_STEER_DELTA))
+    steer_raw = pure_pursuit_steer(pos, heading, target, STEER_GAIN)
 
-    # 6) Curvature estimate (ahead)
-    a = track_xy[_wrap_idx(closest + 8, n)]
-    b = track_xy[_wrap_idx(closest + 20, n)]
-    c = track_xy[_wrap_idx(closest + 35, n)]
-    ab = b - a
-    bc = c - b
-    ang = abs(_angle_wrap(
-        math.atan2(float(bc[1]), float(bc[0])) - math.atan2(float(ab[1]), float(ab[0]))
-    ))
+    # Mild temporal smoothing to reduce oscillations
+    steer = float(np.clip(0.25 * prev_steer + 0.75 * steer_raw, -1.0, 1.0))
 
-    v_target = V_MAX - CURVATURE_SLOWDOWN * ang
-    v_target = float(np.clip(v_target, V_MIN, V_MAX))
+    # Curvature-based target speed (look a bit ahead so you slow before the bend)
+    curv = curvature_ahead(path_xy, idx, look=16)
+    v_target = float(np.clip(V_MAX - CURV_GAIN * curv, V_MIN, V_MAX))
 
-    # Gentle ramp-up early in episode
-    if step_count < 80:
-        ramp = step_count / 80.0
-        v_target = V_MIN + (v_target - V_MIN) * ramp
+    # Throttle/brake: proportional control on speed error with overspeed braking
+    err = v_target - speed
+    gas = float(np.clip(GAS_GAIN * err, 0.0, 1.0))
 
-    # 7) Longitudinal control
-    speed_err = v_target - speed
-    gas = 0.0
+    # If overspeed or tight curvature, brake more
+    overspeed = speed - v_target
     brake = 0.0
+    if overspeed > 1.0:
+        brake = float(np.clip(BRAKE_GAIN * (overspeed / max(v_target, 1.0)), 0.0, 1.0))
+        gas = 0.0
 
-    if speed_err > 1.5:
-        gas = GAS_MAX * min(1.0, speed_err / 10.0) * (1.0 - 0.45 * abs(steer))
-    elif speed_err < -1.5:
-        brake = BRAKE_MAX * min(1.0, abs(speed_err) / 12.0)
-
-    # Additional braking on strong steering
-    if abs(steer) > 0.65:
-        brake = max(brake, 0.20)
+    # Extra caution: in very sharp turns, bias toward coasting if steering is large
+    if abs(steer) > 0.75 and speed > (v_target + 2.0):
+        gas = 0.0
+        brake = float(max(brake, 0.2))
 
     action = np.array([steer, gas, brake], dtype=np.float32)
+    return action, idx, steer
 
-    # 8) Offroad detection (geometry-based)
-    tw = _track_half_width(u)          # half road width
-    off_road = abs(cte) > (tw * 1.10)  # slightly lenient threshold
+def flush_chunk(data_dir: str, worker_id: int, chunk_id: int,
+                states, actions, next_states) -> None:
+    if len(states) == 0:
+        return
+    os.makedirs(data_dir, exist_ok=True)
+    filename = os.path.join(data_dir, f"raceline_chunk_w{worker_id:02d}_{chunk_id:05d}.npz")
+    np.savez(
+        filename,
+        states=np.asarray(states, dtype=np.uint8),
+        actions=np.asarray(actions, dtype=np.float32),
+        next_states=np.asarray(next_states, dtype=np.uint8),
+    )
+    print(f"[Worker {worker_id}] wrote {len(states):,} frames -> {filename}")
 
-    return action, closest, steer, off_road
+def worker_func(worker_id: int) -> None:
+    warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 
-
-def worker_func(worker_id: int):
-    seed = int(time.time()) + worker_id * 1000
+    seed = int(time.time()) + worker_id * 10000
     rng = np.random.RandomState(seed)
+    np.random.seed(seed)
 
     try:
-        env = gym.make("CarRacing-v3", render_mode=None)
+        env = gym.make("CarRacing-v3", render_mode=None, max_episode_steps=MAX_STEPS)
     except Exception:
         env = gym.make("CarRacing-v2", render_mode=None)
 
-    states, actions = [], []
-    success_count = 0
-    fail_count = 0
+    states, actions, next_states = [], [], []
+    prev_idx: Optional[int] = None
+    prev_steer = 0.0
+    chunk_id = 0
 
-    for ep in range(EPISODES_PER_WORKER):
-        obs, _ = env.reset(seed=int(rng.randint(0, 1_000_000)))
-        prev_idx = None
-        prev_steer = 0.0
+    try:
+        for ep in range(EPISODES_PER_WORKER):
+            obs, _ = env.reset(seed=int(rng.randint(0, 2**31 - 1)))
+            # Track is generated on reset; extract centerline once per episode
+            path_xy = get_centerline(env)
 
-        ep_states, ep_actions = [], []
-        off_road_streak = 0
-        step_count = 0
+            prev_idx = None
+            prev_steer = 0.0
 
-        for t in range(MAX_STEPS):
-            s = process_frame(obs)
+            for _ in range(MAX_STEPS):
+                s = process_frame(obs)
 
-            action, prev_idx, prev_steer, off_road = expert_controller(env, prev_idx, prev_steer, step_count)
-            step_count += 1
+                action, prev_idx, prev_steer = raceline_controller(path_xy, env, prev_idx, prev_steer)
 
-            # Grace window (ignore offroad early while car stabilizes)
-            if t < OFFROAD_GRACE_STEPS:
-                off_road = False
+                obs2, _, terminated, truncated, _ = env.step(action)
+                ns = process_frame(obs2)
 
-            if off_road:
-                off_road_streak += 1
-            else:
-                off_road_streak = max(0, off_road_streak - 1)
+                states.append(s)
+                actions.append(action)
+                next_states.append(ns)
 
-            if off_road_streak >= OFFROAD_STREAK_KILL:
-                # Kill + discard this episode segment
-                ep_states, ep_actions = [], []
-                fail_count += 1
-                break
+                obs = obs2
 
-            obs, _, term, trunc, _ = env.step(action)
+                # Periodic flush to keep memory bounded
+                if len(states) >= CHUNK_FRAMES:
+                    flush_chunk(DATA_DIR, worker_id, chunk_id, states, actions, next_states)
+                    chunk_id += 1
+                    states, actions, next_states = [], [], []
 
-            # Skip the very first frames (camera + spawn jitter)
-            if t >= 10:
-                ep_states.append(s)
-                ep_actions.append(action)
+                if terminated or truncated:
+                    break
+    finally:
+        env.close()
 
-            if term or trunc:
-                break
-
-        if len(ep_states) >= MIN_FRAMES_TO_KEEP:
-            states.extend(ep_states)
-            actions.extend(ep_actions)
-            success_count += 1
-
-        if (ep + 1) % 10 == 0:
-            print(
-                f"Worker {worker_id}: Ep {ep+1}/{EPISODES_PER_WORKER} | "
-                f"Success: {success_count} | Fail (OffRoad): {fail_count} | "
-                f"Frames: {len(states)}"
-            )
-
-    env.close()
-
-    if len(states) > 0:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        fname = os.path.join(DATA_DIR, f"race_{worker_id}.npz")
-        np.savez(fname, states=np.array(states, dtype=np.uint8), actions=np.array(actions, dtype=np.float32))
-        print(f"Worker {worker_id}: DONE. Saved {len(states)} CLEAN frames -> {fname}")
-    else:
-        print(f"Worker {worker_id}: FAILED. No valid data collected.")
-
+    # Flush remainder
+    flush_chunk(DATA_DIR, worker_id, chunk_id, states, actions, next_states)
 
 if __name__ == "__main__":
+    os.makedirs(DATA_DIR, exist_ok=True)
+    print("=== Racing Line Data Collection (Pure Pursuit + Curvature Speed Control) ===")
+    print(f"workers={NUM_WORKERS} episodes/worker={EPISODES_PER_WORKER} max_steps={MAX_STEPS} chunk_frames={CHUNK_FRAMES}")
+    print(f"data_dir={DATA_DIR}")
+
     mp.set_start_method("spawn", force=True)
-    with mp.Pool(NUM_WORKERS) as p:
-        p.map(worker_func, range(NUM_WORKERS))
+    with mp.Pool(NUM_WORKERS) as pool:
+        pool.map(worker_func, range(NUM_WORKERS))
