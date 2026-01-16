@@ -6,6 +6,7 @@ data/
 *.pth
 *.ckpt
 *.onnx
+.cache
 
 # --- Python ---
 # Compiled python files (garbage)
