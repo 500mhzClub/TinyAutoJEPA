@@ -10,7 +10,7 @@ import warnings
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", str(min(32, mp.cpu_count()))))
 EPISODES_PER_WORKER = int(os.getenv("EPISODES_PER_WORKER", "80"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "600"))
-DATA_DIR = os.getenv("DATA_DIR", "data")
+DATA_DIR = os.getenv("DATA_DIR", "data_random") # Changed to specific folder for clarity
 IMG_SIZE = int(os.getenv("IMG_SIZE", "64"))
 
 def process_frame(frame: np.ndarray) -> np.ndarray:
@@ -22,11 +22,11 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
     return frame.astype(np.uint8)
 
 def sample_random_action(prev_steer: float) -> tuple[np.ndarray, float]:
-    # High-entropy steering with mild temporal smoothing (prevents pure white noise)
+    # High-entropy steering with mild temporal smoothing
     noise = np.random.uniform(-1.0, 1.0)
     steer = np.clip(0.2 * prev_steer + 0.8 * noise, -1.0, 1.0)
 
-    # Gas/Brake mode switching to avoid tiny simultaneous values
+    # Gas/Brake mode switching
     mode = np.random.choice(["accelerate", "brake", "coast"], p=[0.60, 0.10, 0.30])
     if mode == "accelerate":
         gas = np.random.uniform(0.5, 1.0)
@@ -47,7 +47,10 @@ def worker_func(worker_id: int) -> None:
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
 
-    env = gym.make("CarRacing-v3", render_mode=None, max_episode_steps=MAX_STEPS)
+    try:
+        env = gym.make("CarRacing-v3", render_mode=None, max_episode_steps=MAX_STEPS)
+    except:
+        env = gym.make("CarRacing-v2", render_mode=None)
 
     states, actions, next_states = [], [], []
     prev_steer = 0.0
@@ -63,7 +66,10 @@ def worker_func(worker_id: int) -> None:
 
                 obs2, _, terminated, truncated, _ = env.step(action)
 
+                # For simple random, we treat next state as just the next frame
+                # (Training scripts usually ignore 'next_states' key anyway if using sequence loaders)
                 ns = process_frame(obs2)
+                
                 states.append(s)
                 actions.append(action)
                 next_states.append(ns)
@@ -74,19 +80,21 @@ def worker_func(worker_id: int) -> None:
     finally:
         env.close()
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    filename = os.path.join(DATA_DIR, f"random_chunk_{worker_id}.npz")
-    np.savez_compressed(
-        filename,
-        states=np.asarray(states, dtype=np.uint8),
-        actions=np.asarray(actions, dtype=np.float32),
-        next_states=np.asarray(next_states, dtype=np.uint8),
-    )
-    print(f"[Worker {worker_id}] wrote {len(states):,} frames -> {filename}")
+    if len(states) > 0:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        filename = os.path.join(DATA_DIR, f"random_chunk_{worker_id}.npz")
+        
+        np.savez(
+            filename,
+            states=np.asarray(states, dtype=np.uint8),
+            actions=np.asarray(actions, dtype=np.float32),
+            next_states=np.asarray(next_states, dtype=np.uint8),
+        )
+        print(f"[Worker {worker_id}] wrote {len(states):,} frames -> {filename}")
 
 if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
-    print("=== Random Data Collection (High Entropy) ===")
+    print("=== Random Data Collection (High Entropy / Uncompressed) ===")
     print(f"workers={NUM_WORKERS} episodes/worker={EPISODES_PER_WORKER} max_steps={MAX_STEPS}")
 
     mp.set_start_method("spawn", force=True)

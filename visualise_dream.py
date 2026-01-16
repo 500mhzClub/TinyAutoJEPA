@@ -65,7 +65,7 @@ def generate_dream_batch():
     encoder, predictor, decoder = load_models()
 
     # Prefer race data (cleaner), fallback to regular
-    files = glob.glob("./data_race/*.npz")
+    files = glob.glob("./data/*.npz")
     if not files: files = glob.glob("./data/*.npz")
     if not files: 
         print("❌ No data files found.")
