@@ -13,7 +13,7 @@ NUM_WORKERS = int(os.getenv("NUM_WORKERS", str(min(32, mp.cpu_count()))))
 EPISODES_PER_WORKER = int(os.getenv("EPISODES_PER_WORKER", "80"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "600"))
 
-DATA_DIR = os.getenv("DATA_DIR", "data_raceline")
+DATA_DIR = os.getenv("DATA_DIR", "data_race")
 IMG_SIZE = int(os.getenv("IMG_SIZE", "64"))
 CHUNK_FRAMES = int(os.getenv("CHUNK_FRAMES", "20000"))  # flush periodically to avoid huge RAM
 
