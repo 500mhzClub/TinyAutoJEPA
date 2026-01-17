@@ -3,11 +3,10 @@ import glob
 import numpy as np
 from tqdm import tqdm
 
-DATA_DIRS = [
-    "./data", 
-    "./data_race", 
-    "./data_recovery", 
-    "./data_edge"
+DATA_DIRS = [ 
+    "./data_expert", 
+    "./data_recover", 
+    "./data_random"
 ]
 
 def convert_npz_to_npy(folder):

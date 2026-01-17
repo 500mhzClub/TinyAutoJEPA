@@ -26,17 +26,14 @@ def process_frame(frame: np.ndarray) -> np.ndarray:
     """Resize and crop raw frame for JEPA (64x64)"""
     if frame is None:
         return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
-    # Cut off the bottom status bar (approx 12 pixels in 96px mode)
-    # The raw render is usually bigger, so we resize carefully
     frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return frame.astype(np.uint8)
 
 def get_random_action(prev_steer):
     """Correlated noise for smoother random driving"""
     noise = np.random.uniform(-1.0, 1.0)
-    steer = np.clip(0.4 * prev_steer + 0.6 * noise, -1.0, 1.0) # Smoother steering
+    steer = np.clip(0.4 * prev_steer + 0.6 * noise, -1.0, 1.0)
     
-    # 70% drive forward, 10% brake, 20% coast
     mode = np.random.choice(["accel", "brake", "coast"], p=[0.7, 0.1, 0.2])
     
     if mode == "accel": 
@@ -51,16 +48,12 @@ def get_random_action(prev_steer):
 def run_session(worker_id, mode, model_path, visualize):
     """Worker process to generate data"""
     
-    # 1. Setup Environment chain to match PPO training
     def make_env():
-        # render_mode="rgb_array" allows us to capture clean frames even without a window
         return gym.make("CarRacing-v3", render_mode="rgb_array", max_episode_steps=args.steps)
 
-    # Wrap in DummyVecEnv -> VecFrameStack so the PPO agent feels at home
     vec_env = DummyVecEnv([make_env])
     env = VecFrameStack(vec_env, n_stack=4)
     
-    # 2. Load Agent (if needed)
     model = None
     if mode in ["expert", "recover"]:
         try:
@@ -70,10 +63,9 @@ def run_session(worker_id, mode, model_path, visualize):
             print(f"Worker {worker_id}: Error loading model! Check path.")
             return
 
-    # 3. Data Buffers
-    states_buffer = []      # s_t
-    actions_buffer = []     # a_t
-    next_states_buffer = [] # s_t+1
+    states_buffer = []      
+    actions_buffer = []     
+    next_states_buffer = [] 
     
     seed = int(time.time()) + worker_id * 999
     rng = np.random.RandomState(seed)
@@ -85,78 +77,62 @@ def run_session(worker_id, mode, model_path, visualize):
 
     try:
         while ep_count < target_eps:
-            # Reset
-            obs = env.reset() # This returns the STACKED observation for the model
+            obs = env.reset()
             
-            # For the dataset, we need the RAW frame. 
-            # We grab it directly from the underlying gym env
+            # Capture raw frame for dataset
             raw_frame = env.envs[0].render()
             curr_state_img = process_frame(raw_frame)
             
             prev_steer = 0.0
             
-            # Recover Mode Variables
             sabotage_steps_left = 0
             recovery_cooldown = 0
-            sabotage_action = np.zeros(3)
+            # FIX: Initialize as (1, 3) to match VecEnv expectations
+            sabotage_action = np.zeros((1, 3), dtype=np.float32)
 
             for step in range(args.steps):
                 
                 # --- ACTION SELECTION ---
                 if mode == "random":
-                    action_to_take, prev_steer = get_random_action(prev_steer)
-                    # VecEnv expects shape (n_envs, action_dim) -> (1, 3)
-                    env_action = [action_to_take] 
+                    raw_action, prev_steer = get_random_action(prev_steer)
+                    # FIX: Wrap random action to shape (1, 3)
+                    env_action = np.array([raw_action], dtype=np.float32)
 
                 elif mode == "expert":
-                    # Model expects stacked obs
-                    action_to_take, _ = model.predict(obs, deterministic=True) # Turn off jitter for pure expert data
-                    env_action = action_to_take # model.predict returns correct shape for VecEnv
+                    # PPO predict returns (1, 3) naturally. No wrapping needed.
+                    env_action, _ = model.predict(obs, deterministic=True)
 
                 elif mode == "recover":
-                    # Logic: 
-                    # 1. Wait for cooldown (drive normally)
-                    # 2. Trigger Sabotage (force error)
-                    # 3. Expert takes over (record the fix)
-                    
                     if sabotage_steps_left > 0:
-                        # We are actively crashing the car
-                        action_to_take = sabotage_action
+                        env_action = sabotage_action
                         sabotage_steps_left -= 1
                         if visualize: print(f"\r[Worker {worker_id}] SABOTAGE! {sabotage_steps_left}   ", end="")
                     else:
-                        # Expert driving
-                        action_to_take, _ = model.predict(obs, deterministic=True)
+                        env_action, _ = model.predict(obs, deterministic=True)
                         
-                        # Decrease cooldown
                         if recovery_cooldown > 0:
                             recovery_cooldown -= 1
-                        
-                        # Randomly trigger sabotage if cooldown is over
-                        elif rng.rand() < 0.008: # ~0.8% chance per frame (approx once per 100-150 steps)
-                            # Pick a nasty action
-                            sabotage_steps_left = rng.randint(5, 15) # 5-15 frames of chaos
-                            recovery_cooldown = 100 # Don't sabotage again immediately
+                        # TUNED: Less frequent (0.5%), shorter burst, less throttle
+                        elif rng.rand() < 0.005: 
+                            sabotage_steps_left = rng.randint(2, 6) # Only 2-6 frames (quick jerk)
+                            recovery_cooldown = 200 # Wait longer before next attack
                             
-                            # Random Hard Left/Right + Gas or Brake
                             force_steer = 1.0 if rng.rand() > 0.5 else -1.0
-                            force_gas = np.random.uniform(0.5, 1.0)
-                            sabotage_action = np.array([force_steer, force_gas, 0.0], dtype=np.float32)
-
-                    env_action = action_to_take if isinstance(action_to_take, list) else [action_to_take]
+                            force_gas = np.random.uniform(0.2, 0.5) # Less gas so it doesn't fly off
+                            
+                            # FIX: Define sabotage as (1, 3)
+                            sabotage_action = np.array([[force_steer, force_gas, 0.0]], dtype=np.float32)
 
                 # --- STEP ---
-                # Step the environment
+                # Pass the correctly shaped (1, 3) action directly
                 obs, _, dones, infos = env.step(env_action)
                 
-                # Capture the NEW raw frame for the dataset (Next State)
                 next_raw_frame = env.envs[0].render()
                 next_state_img = process_frame(next_raw_frame)
 
                 # --- VISUALIZATION ---
                 if visualize:
                     disp = cv2.resize(next_raw_frame, (400, 300))
-                    # Add text
                     status = "EXPERT"
                     if mode == "recover":
                         status = "SABOTAGE" if sabotage_steps_left > 0 else "RECOVERING"
@@ -168,14 +144,13 @@ def run_session(worker_id, mode, model_path, visualize):
                         return
 
                 # --- SAVE TO BUFFER ---
-                # Ensure action is just a flat array (3,) not (1,3)
-                flat_action = env_action[0] if len(env_action) == 1 else env_action
+                # We save the flat action (3,) to disk, not the nested (1,3)
+                flat_action = env_action[0]
 
                 states_buffer.append(curr_state_img)
                 actions_buffer.append(flat_action)
                 next_states_buffer.append(next_state_img)
                 
-                # Update state for next loop
                 curr_state_img = next_state_img
                 
                 if dones[0]:
@@ -190,8 +165,6 @@ def run_session(worker_id, mode, model_path, visualize):
         env.close()
         if visualize: cv2.destroyAllWindows()
 
-    # --- SAVE TO DISK ---
-    # Only save if we actually collected data
     if len(states_buffer) > 0:
         os.makedirs(DATA_DIR, exist_ok=True)
         filename = os.path.join(DATA_DIR, f"{mode}_w{worker_id}_{int(time.time())}.npz")
@@ -206,7 +179,6 @@ def run_session(worker_id, mode, model_path, visualize):
         print(f"Worker {worker_id}: Save Complete.")
 
 if __name__ == "__main__":
-    # Windows/Mac/Linux compatibility
     mp.set_start_method("spawn", force=True)
     
     print(f"--- Generating {args.mode.upper()} Data ---")
@@ -215,9 +187,7 @@ if __name__ == "__main__":
     print(f"Total Target: {args.workers * args.episodes * args.steps} frames (approx)")
     
     if args.visualize:
-        # Single process for visualization
         run_session(0, args.mode, args.model, True)
     else:
-        # Parallel generation
         with mp.Pool(args.workers) as pool:
             pool.starmap(run_session, [(i, args.mode, args.model, False) for i in range(args.workers)])

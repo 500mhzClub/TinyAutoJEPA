@@ -6,7 +6,7 @@ import random
 from tqdm import tqdm
 
 # --- Config ---
-DIRS_TO_CHECK = ["./data_race", "./data_recovery", "./data"]
+DIRS_TO_CHECK = ["./data_recover", "./data_expert", "./data_random"]
 SAMPLES_PER_FOLDER = 5  # Check 5 random files per folder
 FRAMES_TO_SHOW = 8      # Show 8 frames from each file
 OUTPUT_DIR = "data_inspection"

@@ -27,20 +27,19 @@ class CFG:
     # DataLoader
     num_workers: int = int(os.getenv("NUM_WORKERS", "8"))
     prefetch_factor: int = int(os.getenv("PREFETCH_FACTOR", "2"))
-    # We can safely use persistent workers now because memory footprint is low
     persistent_workers: bool = os.getenv("PERSISTENT_WORKERS", "1") == "1"
     
-    # Dataset dirs
-    data_random: str = os.getenv("DATA_RANDOM", "./data")
-    data_race: str = os.getenv("DATA_RACE", "./data_race")
-    data_recovery: str = os.getenv("DATA_RECOVERY", "./data_recovery")
-    data_edge: str = os.getenv("DATA_EDGE", "./data_edge")
+    # --- UPDATED DATASET DIRS ---
+    # These now match the output folders from collect_data.py
+    data_random: str = os.getenv("DATA_RANDOM", "./data_random")
+    data_expert: str = os.getenv("DATA_EXPERT", "./data_expert")  # Renamed from data_race
+    data_recover: str = os.getenv("DATA_RECOVER", "./data_recover") # Renamed from data_recovery
     
     # Saving/validation cadence
     model_dir: str = os.getenv("MODEL_DIR", "./models")
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
     validate_every_epochs: int = int(os.getenv("VALIDATE_EVERY_EPOCHS", "5"))
-    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "20"))  
+    max_epoch_ckpts: int = int(os.getenv("MAX_EPOCH_CKPTS", "5"))  
     
     # Resume
     resume: bool = os.getenv("RESUME", "1") == "1"
@@ -64,7 +63,6 @@ def seed_everything(seed: int) -> None:
 def worker_init_fn(worker_id: int) -> None:
     cv2.setNumThreads(0)
     cv2.ocl.setUseOpenCL(False)
-    # Different seed per worker
     s = CFG.seed + worker_id
     random.seed(s)
     np.random.seed(s)
@@ -84,7 +82,7 @@ class RunningAverage:
 
 # Dataset Helpers
 def _list_npy(dir_path: str) -> List[str]:
-    if not dir_path:
+    if not dir_path or not os.path.exists(dir_path):
         return []
     # Search for .npy files (converted from .npz)
     return sorted(glob.glob(os.path.join(dir_path, "*.npy")))
@@ -102,38 +100,39 @@ class BalancedMixedDataset(IterableDataset):
     def __init__(self):
         super().__init__()
         self.random_files = _list_npy(CFG.data_random)
-        self.race_files = _list_npy(CFG.data_race)
-        self.recovery_files = _list_npy(CFG.data_recovery)
-        self.edge_files = _list_npy(CFG.data_edge)
+        self.expert_files = _list_npy(CFG.data_expert)
+        self.recover_files = _list_npy(CFG.data_recover)
 
-        if not (self.random_files or self.race_files or self.recovery_files or self.edge_files):
+        # Sanity Check
+        total_files = len(self.random_files) + len(self.expert_files) + len(self.recover_files)
+        if total_files == 0:
             raise RuntimeError(
-                "No .npy files found in any data directories. "
-                "Did you run the conversion script to unpack .npz -> .npy?"
+                f"No .npy files found! \n"
+                f"Checked: {CFG.data_random}, {CFG.data_expert}, {CFG.data_recover}\n"
+                f"DID YOU RUN THE UNPACKER SCRIPT?"
             )
 
         max_files = max(
             len(self.random_files),
-            len(self.race_files),
-            len(self.recovery_files),
-            len(self.edge_files),
+            len(self.expert_files),
+            len(self.recover_files),
         )
 
+        # Create a balanced interleaved list
         self.balanced_files: List[str] = []
         for i in range(max_files):
             if self.random_files:
                 self.balanced_files.append(self.random_files[i % len(self.random_files)])
-            if self.race_files:
-                self.balanced_files.append(self.race_files[i % len(self.race_files)])
-            if self.recovery_files:
-                self.balanced_files.append(self.recovery_files[i % len(self.recovery_files)])
-            if self.edge_files:
-                self.balanced_files.append(self.edge_files[i % len(self.edge_files)])
+            if self.expert_files:
+                self.balanced_files.append(self.expert_files[i % len(self.expert_files)])
+            if self.recover_files:
+                self.balanced_files.append(self.recover_files[i % len(self.recover_files)])
 
         print(f"Balanced Dataset: {len(self.balanced_files)} files.")
         
         self.total_frames = 0
-        for f in tqdm(self.balanced_files, desc="Scanning Dataset"):
+        print("Scanning Dataset metadata (this might take a moment)...")
+        for f in self.balanced_files:
             self.total_frames += _count_frames_npy(f)
         print(f"Total Frames: {self.total_frames:,}")
 
@@ -156,7 +155,6 @@ class BalancedMixedDataset(IterableDataset):
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
         
-        # Unique seed per worker/epoch combination to ensure variation
         current_seed = CFG.seed + worker_id + (self.epoch * 10000)
         
         rng = random.Random(current_seed)
@@ -165,19 +163,15 @@ class BalancedMixedDataset(IterableDataset):
         
         # Shard files across workers
         my_files = self.balanced_files[worker_id::num_workers]
-        my_files = list(my_files)
-        
         # Shuffle file order
         rng.shuffle(my_files)
         
         for f in my_files:
             try:
                 # MMAP MODE: Creates a virtual array on disk.
-                # No data is loaded into RAM until specific indices are accessed.
                 raw = np.load(f, mmap_mode="r")
                 
-                # We shuffle indices, but we access the disk randomly.
-                # The OS Page Cache handles the buffering.
+                # Shuffle indices for this file
                 idxs = np_rng.permutation(len(raw))
                 
                 for idx in idxs:
@@ -186,16 +180,13 @@ class BalancedMixedDataset(IterableDataset):
                     if img_np.shape[0] != 64 or img_np.shape[1] != 64:
                         img_np = cv2.resize(img_np, (64, 64), interpolation=cv2.INTER_AREA)
 
-                    # [FIXED] Force a copy here to detach from the read-only mmap buffer.
-                    # This prevents the "UserWarning: The given NumPy array is not writable" error.
+                    # Copy to detach from mmap
                     img_copy = np.array(img_np, copy=True)
                     
                     img = torch.from_numpy(img_copy).float().div_(255.0)
                     img = img.permute(2, 0, 1)
                     yield self.transform(img), self.transform(img)
                 
-                # No explicit 'del' needed; Python closes file handle automatically
-
             except Exception:
                 continue
 
@@ -384,7 +375,6 @@ def train() -> None:
     projector.train()
 
     for epoch in range(start_epoch, CFG.epochs):
-        # Update epoch count in dataset for RNG mixing
         dataset.set_epoch(epoch)
         
         if epoch == start_epoch:
