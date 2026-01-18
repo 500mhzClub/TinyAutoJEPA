@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-# --- RESNET-10 ENCODER (UNCHANGED - This is perfect) ---
+# --- RESNET-10 ENCODER (UNCHANGED) ---
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
@@ -54,9 +54,7 @@ class TinyEncoder(nn.Module):
         x = self.avgpool(x)
         return x.flatten(1)
 
-# --- TINY PROJECTOR (The Fix) ---
-# Previous: 1024 -> 1024 -> 1024 (Heavy!)
-# New:      512  -> 512  -> 512  (Fast!)
+# --- TINY PROJECTOR (UNCHANGED) ---
 class Projector(nn.Module):
     def __init__(self, input_dim=512, hidden_dim=512, output_dim=512):
         super().__init__()
@@ -64,31 +62,51 @@ class Projector(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            # Removed one hidden layer for speed
             nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
         return self.net(x)
 
-# --- PREDICTOR (Standard) ---
+# --- ROBUST PREDICTOR (The Fix) ---
+# Changes:
+# 1. Residual Connection (z_next = z + delta)
+# 2. LayerNorm on Input and Output (Keeps values stable)
 class Predictor(nn.Module):
     def __init__(self, input_dim=512, action_dim=3, hidden_dim=512):
         super().__init__()
+        
+        self.ln_in = nn.LayerNorm(input_dim)
+        
         self.net = nn.Sequential(
             nn.Linear(input_dim + action_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim), # Changed BN to LN for better sequence handling
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, input_dim) 
         )
-    def forward(self, z, action):
-        x = torch.cat([z, action], dim=1)
-        return self.net(x)
+        
+        self.ln_out = nn.LayerNorm(input_dim)
 
-# --- DECODERS (Standard) ---
+    def forward(self, z, action):
+        # 1. Normalize input state
+        z_norm = self.ln_in(z)
+        
+        # 2. Concat state + action
+        x = torch.cat([z_norm, action], dim=1)
+        
+        # 3. Predict the CHANGE (delta)
+        delta = self.net(x)
+        
+        # 4. Add to original state (Residual Connection)
+        z_next = z + delta
+        
+        # 5. Final safety clamp
+        return self.ln_out(z_next)
+
+# --- DECODERS (UNCHANGED) ---
 class TinyDecoder(nn.Module):
     def __init__(self, latent_dim=512):
         super().__init__()
@@ -107,18 +125,3 @@ class TinyDecoder(nn.Module):
         x = self.fc_input(z)
         x = x.view(-1, 256, 4, 4)
         return self.net(x)
-    
-class CostModel(nn.Module):
-    def __init__(self, input_dim=512, hidden_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-    def forward(self, x): return self.net(x)

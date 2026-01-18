@@ -9,86 +9,87 @@ import os
 import cv2
 import random
 from tqdm import tqdm
+
+# --- IMPORT YOUR NETWORKS ---
+# Ensure networks.py is in the same directory
 from networks import TinyEncoder, TinyDecoder
 
-BATCH_SIZE = 128   
-EPOCHS = 30
-LR = 1e-3
+# --- CONFIG ---
+BATCH_SIZE = 1024      # Increased for R9700/3090 class GPUs
+EPOCHS = 30            # 30 Epochs is sufficient for convergence
+LR = 1e-3              # Standard Adam LR for this batch size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Paths
 ENCODER_PATH = "./models/encoder_mixed_final.pth"
-FINAL_MODEL_PATH = "models/decoder_vicreg_final.pth"
+FINAL_MODEL_PATH = "models/decoder_final.pth"
 
 class StreamingDecoderDataset(IterableDataset):
     def __init__(self):
         """
-        Streams Race and Recovery data from disk.
-        Uses ~200MB RAM regardless of dataset size.
+        Streams data from all available .npz folders.
         """
-        self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz"))
+        # Search for data in all likely locations
+        self.files = sorted(
+            glob.glob("./data_race/*.npz") + 
+            glob.glob("./data_recovery/*.npz") +
+            glob.glob("./data_expert/*.npz") + 
+            glob.glob("./data_random/*.npz")
+        )
         self.epoch = 0
         
+        print(f"--- Decoder Dataset Setup ---")
         if not self.files:
-            raise ValueError("No .npz files found! Check ./data_race and ./data_recovery")
-            
-        print(f"--- Decoder Dataset ---")
-        print(f"Found {len(self.files)} files.")
+            print("❌ ERROR: No .npz files found! Checked: data_race, data_recovery, etc.")
+            raise FileNotFoundError("No data found.")
+        else:
+            print(f"✅ Found {len(self.files)} files.")
+            print(f"   (Batch Size: {BATCH_SIZE} | Device: {DEVICE})")
         
-        # Optional: Quick scan for total length (for progress bar)
-        # If this is too slow, just set self.total_frames = 5700000 (hardcoded)
-        self.total_frames = 0
-        print("Scanning dataset size...")
-        for f in tqdm(self.files):
-            try:
-                with np.load(f, mmap_mode='r') as d:
-                    if 'states' in d: self.total_frames += d['states'].shape[0]
-                    elif 'obs' in d: self.total_frames += d['obs'].shape[0]
-            except: pass
-        print(f"Total Frames: {self.total_frames:,}")
+        # Rough estimate for progress bar (assuming ~30k frames per file)
+        # This doesn't need to be exact, just gives tqdm a target
+        self.total_frames = len(self.files) * 30000 
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __iter__(self):
         worker_info = get_worker_info()
-        if worker_info is not None:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-        else:
-            worker_id = 0
-            num_workers = 1
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
         
-        # Seeding for reproducible shuffling that changes every epoch
+        # Seeding for distinct data stream per worker/epoch
         seed = 42 + self.epoch + worker_id
         rng = random.Random(seed)
         np_rng = np.random.default_rng(seed)
         
         # Shard files across workers
-        worker_files = self.files[worker_id::num_workers]
-        rng.shuffle(worker_files)
+        my_files = self.files[worker_id::num_workers]
+        rng.shuffle(my_files)
         
-        for f in worker_files:
+        for f in my_files:
             try:
-                with np.load(f) as arr:
-                    if 'states' in arr: obs = arr['states']
-                    elif 'obs' in arr: obs = arr['obs']
+                with np.load(f) as data:
+                    # Robust key handling
+                    if 'states' in data: obs = data['states']
+                    elif 'obs' in data: obs = data['obs']
                     else: continue
                 
-                # Resize if needed (vectorized)
+                # Resize if needed (vectorized for speed)
                 if obs.shape[1] != 64:
+                    # If data is not 64x64, resize it
                     obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
                 
-                # Shuffle frames within the file
+                # Shuffle frames inside the file
                 indices = np_rng.permutation(len(obs))
                 
                 for idx in indices:
-                    # Normalize to 0-1 float
+                    # Convert to Tensor, Normalize 0-1
+                    # Input: (64, 64, 3) uint8 -> Output: (3, 64, 64) float
                     img = torch.from_numpy(obs[idx]).float().div_(255.0)
-                    # Yield simple (img) since input==target
-                    yield img.permute(2, 0, 1) # HWC -> CHW
+                    yield img.permute(2, 0, 1) 
                     
-            except Exception as e:
+            except Exception:
                 continue
 
     def __len__(self):
@@ -96,104 +97,94 @@ class StreamingDecoderDataset(IterableDataset):
 
 def train():
     if not os.path.exists(ENCODER_PATH):
-        raise FileNotFoundError(f"Encoder not found at {ENCODER_PATH}! Run train_encoder.py first.")
+        raise FileNotFoundError(f"Encoder not found at {ENCODER_PATH}! Check path.")
 
-    print(f"Initializing Decoder Training on {DEVICE}")
+    print(f"Initializing Decoder Training...")
+    os.makedirs("visuals", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
     
-    # --- Load Frozen Encoder ---
-    print(f"Loading encoder from: {ENCODER_PATH}")
+    # 1. Load Frozen Encoder
+    print(f"Loading Frozen Encoder: {ENCODER_PATH}")
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
+    for p in encoder.parameters(): p.requires_grad = False
     
+    # 2. Initialize Decoder
     decoder = TinyDecoder().to(DEVICE)
-    optimizer = optim.Adam(decoder.parameters(), lr=LR)
+    optimizer = optim.AdamW(decoder.parameters(), lr=LR, weight_decay=1e-4)
     criterion = nn.MSELoss()
     
-    scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
+    # Mixed Precision Scaler
+    scaler = torch.amp.GradScaler('cuda')
     
+    # 3. Setup Data
     dataset = StreamingDecoderDataset()
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
-        num_workers=6,     # Safe to increase now since RAM usage is low
+        num_workers=8,      # High worker count to keep GPU fed
         pin_memory=True,
-        persistent_workers=False # Safe for set_epoch
+        persistent_workers=False
     )
-
-    os.makedirs("visuals", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
-
+    
+    # 4. Training Loop
     print("Starting Training Loop...")
     
-    # Handle steps manually for IterableDataset
-    steps_per_epoch = len(dataset) // BATCH_SIZE
-
     for epoch in range(EPOCHS):
-        dataset.set_epoch(epoch) # Shuffle data differently each time
+        dataset.set_epoch(epoch)
         decoder.train()
         
-        pbar = tqdm(dataloader, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        
-        last_imgs = None
-        last_recon = None
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         epoch_loss = 0.0
         batches = 0
+        
+        # Holders for visualization
+        last_imgs, last_recon = None, None
         
         for imgs in pbar:
             imgs = imgs.to(DEVICE, non_blocking=True)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            if scaler:
-                with torch.amp.autocast('cuda'):
-                    # Encoder forward (Frozen)
-                    with torch.no_grad():
-                        z = encoder(imgs)
-                    
-                    # Decoder forward
-                    recon = decoder(z)
-                    loss = criterion(recon, imgs)
-                
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            with torch.amp.autocast('cuda'):
+                # Encode (Frozen)
                 with torch.no_grad():
                     z = encoder(imgs)
+                
+                # Decode (Trainable)
                 recon = decoder(z)
                 loss = criterion(recon, imgs)
-                loss.backward()
-                optimizer.step()
             
-            loss_val = loss.item()
-            epoch_loss += loss_val
+            # Backprop
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
             batches += 1
-            pbar.set_postfix(loss=f"{loss_val:.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
             
-            # Save for visualization
-            if batches % 100 == 0:
-                last_imgs = imgs
-                last_recon = recon
+            # Grab a batch for visualization every ~500 steps
+            if batches % 500 == 0:
+                last_imgs, last_recon = imgs, recon
         
-        if batches > 0:
-            avg_loss = epoch_loss / batches
-            print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.5f}")
+        # --- End of Epoch Tasks ---
+        
+        # 1. Save Visuals
+        if last_imgs is not None:
+            # Create a grid: Top 8 Real, Bottom 8 Fake
+            comparison = torch.cat([last_imgs[:8], last_recon[:8]], dim=0)
+            save_image(comparison, f"visuals/decoder_ep{epoch+1}.png", nrow=8)
+            print(f"  --> Visuals saved: visuals/decoder_ep{epoch+1}.png")
 
-        # Checkpoints & Visuals
-        if (epoch+1) % 5 == 0 or (epoch+1) == EPOCHS:
-            torch.save(decoder.state_dict(), f"models/decoder_vicreg_ep{epoch+1}.pth")
-            
-            if last_imgs is not None:
-                # Top row: Original, Bottom row: Reconstructed
-                comparison = torch.cat([last_imgs[:8], last_recon[:8]], dim=0)
-                save_image(comparison, f"visuals/reconstruct_ep{epoch+1}.png", nrow=8)
-                print(f"Saved visual comparison to visuals/reconstruct_ep{epoch+1}.png")
+        # 2. Save Checkpoint
+        if (epoch+1) % 5 == 0:
+            torch.save(decoder.state_dict(), f"models/decoder_ep{epoch+1}.pth")
 
+    # Save Final
     torch.save(decoder.state_dict(), FINAL_MODEL_PATH)
-    print(f"Decoder Training Complete.")
+    print(f"✅ Decoder Training Complete. Saved to {FINAL_MODEL_PATH}")
 
 if __name__ == "__main__":
     train()
