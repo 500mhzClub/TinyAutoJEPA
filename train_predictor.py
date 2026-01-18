@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 import numpy as np
@@ -7,251 +8,224 @@ import glob
 import os
 import cv2
 import random
-import math
 from tqdm import tqdm
+
+# --- IMPORT YOUR NETWORKS ---
 from networks import TinyEncoder, Predictor
 
-BATCH_SIZE = 64     
-EPOCHS = 40         
-LR = 1e-4
+# --- R9700 OPTIMIZED CONFIG ---
+BATCH_SIZE = 256       # Increased to saturate 32GB VRAM
+EPOCHS = 50            # Increased for fine-tuning
+LR = 5e-4              # Increased to match larger batch
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Sequence Settings
-PRED_HORIZON = 15    
+PRED_HORIZON = 15      # How many steps into the future to predict
 SEQUENCE_LEN = PRED_HORIZON + 1 
 ENCODER_PATH = "./models/encoder_mixed_final.pth" 
+NUM_WORKERS = 8        # Safe limit for shared memory
+MAX_SEQS_PER_WORKER = 5000 
 
-
-NUM_WORKERS = 8
-MAX_SEQS_PER_WORKER = 20000 
-
+# --- DATASET ---
 class ShardedSeqDataset(IterableDataset):
     def __init__(self):
+        # Load BOTH Race and Recovery to learn "Stay on track" AND "Get back on track"
         self.files = sorted(glob.glob("./data_race/*.npz") + glob.glob("./data_recovery/*.npz"))
-        
-        self.total_seqs = 0
-        self.epoch = 0 # Track epoch for shuffling
+        self.epoch = 0 
         
         print(f"--- Predictor Training Setup ---")
-        print(f"Sources: Race (Expert) + Recovery (Correction)")
-        print(f"Scanning {len(self.files)} files for sequence counts...")
-        
-        # quick scan to count total sequences for progress bar
-        for f in tqdm(self.files):
-            try:
-                with np.load(f, mmap_mode='r') as d:
-                    if 'states' in d: n = d['states'].shape[0]
-                    elif 'obs' in d: n = d['obs'].shape[0]
-                    else: continue
-                    if n > SEQUENCE_LEN:
-                        self.total_seqs += (n - SEQUENCE_LEN)
-            except: pass
-            
-        print(f"✅ Total Sequences Available: {self.total_seqs:,}")
+        print(f"Found {len(self.files)} trajectory files.")
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __iter__(self):
         worker_info = get_worker_info()
-        if worker_info is not None:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-        else:
-            worker_id = 0
-            num_workers = 1
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
         
-        # Deterministic Shuffling based on Epoch
-        # This ensures every epoch sees data in a different order, avoiding "static batch" overfitting.
-        rng = random.Random(self.epoch + worker_id + 1337)
-        
-        # Partition files across workers
+        # Shuffle files uniquely per epoch to prevent static batches
+        rng = random.Random(self.epoch + worker_id + 999)
         my_files = self.files[worker_id::num_workers]
-        rng.shuffle(my_files) 
+        rng.shuffle(my_files)
         
-        sequences_buffer = []
+        buffer = []
         
         for f in my_files:
-            if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: 
-                break
-                
             try:
                 with np.load(f) as data:
+                    # Handle different naming conventions in .npz
                     if 'states' in data: 
-                        obs_raw = data['states']
-                        act_raw = data['actions']
+                        obs = data['states']
+                        act = data['actions']
                     elif 'obs' in data: 
-                        obs_raw = data['obs']
-                        act_raw = data['action']
+                        obs = data['obs']
+                        act = data['action']
                     else: continue
                 
-                length = len(obs_raw)
-                if length < SEQUENCE_LEN: continue
-
-                # Resize if necessary (vectorized for speed)
-                if obs_raw.shape[1] != 64:
-                    obs_raw = np.array([cv2.resize(img, (64, 64)) for img in obs_raw])
-
-                valid_starts = range(0, length - SEQUENCE_LEN)
+                # Filter short sequences
+                if len(obs) < SEQUENCE_LEN: continue
                 
-                for start_t in valid_starts:
-                    if len(sequences_buffer) >= MAX_SEQS_PER_WORKER: break
-                    
-                    end_t = start_t + SEQUENCE_LEN
-                    o_chunk = obs_raw[start_t:end_t]     # Shape: (Seq, 64, 64, 3)
-                    a_chunk = act_raw[start_t:end_t-1]   # Shape: (Seq-1, ActionDim)
-                    
-                    sequences_buffer.append((o_chunk, a_chunk))
-            except Exception as e: 
-                pass
-            
-        #STREAM PHASE
-        # Shuffle buffer to break temporal correlation between consecutive batches
-        rng.shuffle(sequences_buffer)
-        
-        for o_chunk, a_chunk in sequences_buffer:
-            obs_seq = torch.from_numpy(o_chunk).float() / 255.0
-            obs_seq = obs_seq.permute(0, 3, 1, 2) # T, C, H, W
-            act_seq = torch.from_numpy(a_chunk).float()
-            yield obs_seq, act_seq
-            
-    def __len__(self): 
-        return self.total_seqs
+                # Resize if necessary (CPU side, done once per file)
+                if obs.shape[1] != 64:
+                    obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
 
+                # Sliding Window Generation
+                # Stride of 4 reduces redundancy and speeds up training 4x
+                stride = 4 
+                for t in range(0, len(obs) - SEQUENCE_LEN, stride):
+                    o_seq = obs[t : t + SEQUENCE_LEN]
+                    a_seq = act[t : t + SEQUENCE_LEN - 1] # Actions are N-1
+                    buffer.append((o_seq, a_seq))
+
+                    # Yield chunks to prevent RAM spikes
+                    if len(buffer) >= 1000: 
+                         rng.shuffle(buffer)
+                         for b_o, b_a in buffer:
+                             yield self._format(b_o, b_a)
+                         buffer = []
+            except Exception: pass
+            
+        # Yield any remaining items
+        rng.shuffle(buffer)
+        for b_o, b_a in buffer:
+            yield self._format(b_o, b_a)
+
+    def _format(self, o, a):
+        # 0-1 Scaling (Matches Encoder Training)
+        o_t = torch.from_numpy(o).float() / 255.0
+        o_t = o_t.permute(0, 3, 1, 2) # T, C, H, W
+        a_t = torch.from_numpy(a).float()
+        return o_t, a_t
+
+# --- VALIDATION ---
 @torch.no_grad()
 def validate(encoder, predictor, val_loader):
-    """Checks how well the model predicts WITHOUT teacher forcing (Autoregressive)"""
     encoder.eval()
     predictor.eval()
     total_loss = 0
-    steps = 0
+    count = 0
     
-    # Validate on a small subset (50 batches) to save time
-    for i, (obs_seq, act_seq) in enumerate(val_loader):
-        if i > 50: break
+    print("  >>> Validating (Autoregressive Rollout)...")
+    for i, (obs, act) in enumerate(val_loader):
+        if i >= 20: break # Validate on 20 batches
         
-        obs_seq, act_seq = obs_seq.to(DEVICE), act_seq.to(DEVICE)
-        B, T_plus_1, C, H, W = obs_seq.shape
+        obs, act = obs.to(DEVICE), act.to(DEVICE)
+        B, T, C, H, W = obs.shape
         
-        # Encode inputs
-        obs_flat = obs_seq.view(-1, C, H, W)
-        z_flat = encoder(obs_flat)
-        z_seq = z_flat.view(B, T_plus_1, -1)
+        # Get Ground Truth Latents
+        with torch.no_grad():
+            z_gt = encoder(obs.view(-1, C, H, W)).view(B, T, -1)
+            
+        z_curr = z_gt[:, 0, :]
+        batch_loss = 0
         
-        loss = 0
-        z_current = z_seq[:, 0, :]
-        
-        # PURE AUTOREGRESSIVE Validation (No help from ground truth)
+        # Pure Autoregressive Loop (No Teacher Forcing)
         for t in range(PRED_HORIZON):
-            action = act_seq[:, t, :]
-            z_target = z_seq[:, t+1, :]
+            z_pred = predictor(z_curr, act[:, t, :])
+            z_true = z_gt[:, t+1, :]
             
-            z_next_pred = predictor(z_current, action)
-            loss += nn.MSELoss()(z_next_pred, z_target)
+            batch_loss += F.mse_loss(z_pred, z_true)
+            z_curr = z_pred # Use own prediction
             
-            # Always use own prediction
-            z_current = z_next_pred
-            
-        total_loss += (loss.item() / PRED_HORIZON)
-        steps += 1
+        total_loss += batch_loss.item()
+        count += 1
         
-    avg_loss = total_loss / steps if steps > 0 else 0
-    print(f"  >>> Validation Loss (Autoregressive): {avg_loss:.6f}")
-    
-    encoder.eval() 
-    predictor.train() 
-    return avg_loss
+    avg = total_loss / count
+    print(f"  >>> Val MSE: {avg:.5f}")
+    predictor.train()
 
+# --- TRAINING ---
 def train():
-    print(f"Training Predictor on {DEVICE}")
+    # Enable Kernel Autotuning for Speed
+    torch.backends.cudnn.benchmark = True
+    os.makedirs("models", exist_ok=True)
     
     if not os.path.exists(ENCODER_PATH):
-        raise FileNotFoundError(f"Encoder not found at {ENCODER_PATH}! Run train_encoder.py first.")
+        raise FileNotFoundError(f"Encoder not found at {ENCODER_PATH}")
 
-    #Setup Frozen Encoder
-    print("Loading Encoder...")
+    # 1. Load Frozen Encoder
+    print(f"Loading Encoder from {ENCODER_PATH}...")
     encoder = TinyEncoder().to(DEVICE)
     encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
     encoder.eval()
     for p in encoder.parameters(): p.requires_grad = False
-
-    #Setup Predictor
-    predictor = Predictor().to(DEVICE)
-    optimizer = optim.Adam(predictor.parameters(), lr=LR)
-    criterion = nn.MSELoss()
-    scaler = torch.amp.GradScaler('cuda')
-
-    # Data
-    dataset = ShardedSeqDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     
-    #Training Loop
-    os.makedirs("models", exist_ok=True)
-    steps_per_epoch = len(dataset) // BATCH_SIZE 
-
+    # 2. Setup Predictor
+    predictor = Predictor().to(DEVICE)
+    optimizer = optim.AdamW(predictor.parameters(), lr=LR, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler('cuda')
+    
+    # 3. Data
+    dataset = ShardedSeqDataset()
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
+    
+    # 4. Loop
+    print(f"Starting Training on {DEVICE} (Batch: {BATCH_SIZE}, LR: {LR})")
+    
     for epoch in range(EPOCHS):
-        dataset.set_epoch(epoch) # Critical for shuffling
+        dataset.set_epoch(epoch)
         predictor.train()
         
-        # Curriculum Learning: Decay Teacher Forcing from 1.0 -> 0.0
-        # This helps the model learn initial dynamics before being forced to fly solo.
-        tf_ratio = max(0.0, 1.0 - (epoch / (EPOCHS * 0.8))) 
+        # Teacher Forcing Schedule: 1.0 -> 0.0 over 20 epochs
+        tf_prob = max(0.0, 1.0 - (epoch / 20.0))
         
-        pbar = tqdm(dataloader, total=steps_per_epoch, desc=f"Ep {epoch+1} (TF={tf_ratio:.2f})")
+        pbar = tqdm(loader, desc=f"Ep {epoch+1} [TF={tf_prob:.2f}]")
         epoch_loss = 0
-        batch_count = 0
-
-        for obs_seq, act_seq in pbar:
-            obs_seq = obs_seq.to(DEVICE, non_blocking=True)
-            act_seq = act_seq.to(DEVICE, non_blocking=True)
+        steps = 0
+        
+        for obs, act in pbar:
+            obs = obs.to(DEVICE, non_blocking=True)
+            act = act.to(DEVICE, non_blocking=True)
             
-            B, T_plus_1, C, H, W = obs_seq.shape
-            obs_flat = obs_seq.view(-1, C, H, W)
-
-            optimizer.zero_grad()
-
+            B, T, C, H, W = obs.shape
+            
             with torch.amp.autocast('cuda'):
+                # Encode ALL observations at once (Fastest)
                 with torch.no_grad():
-                    z_flat = encoder(obs_flat)
-                    z_seq = z_flat.view(B, T_plus_1, -1)
+                    z_all = encoder(obs.view(-1, C, H, W)).view(B, T, -1)
                 
                 loss = 0
-                z_current = z_seq[:, 0, :] 
+                z_curr = z_all[:, 0, :] # Start state
                 
+                # Rollout
                 for t in range(PRED_HORIZON):
-                    action = act_seq[:, t, :]    
-                    z_target = z_seq[:, t+1, :]  
+                    # Ground Truth next state
+                    z_target = z_all[:, t+1, :]
                     
-                    z_next_pred = predictor(z_current, action)
-                    loss += criterion(z_next_pred, z_target)
+                    # Predict
+                    z_pred = predictor(z_curr, act[:, t, :])
                     
-                    # Teacher Forcing: Randomly decide to use Truth or Prediction for next step
-                    if random.random() < tf_ratio:
-                        z_current = z_target
+                    # Loss: MSE (Magnitude) + Cosine (Direction)
+                    mse = F.mse_loss(z_pred, z_target)
+                    cos = 1.0 - F.cosine_similarity(z_pred, z_target, dim=1).mean()
+                    
+                    # Small weight on Cosine helps steering accuracy
+                    loss += mse + (0.05 * cos)
+                    
+                    # Teacher Forcing Logic
+                    if random.random() < tf_prob:
+                        z_curr = z_target 
                     else:
-                        z_current = z_next_pred
+                        z_curr = z_pred   
                 
-                # Normalize loss by horizon
                 loss = loss / PRED_HORIZON
 
+            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             
-            curr_loss = loss.item()
-            epoch_loss += curr_loss
-            batch_count += 1
-            pbar.set_postfix(loss=f"{curr_loss:.6f}")
-
-        if batch_count > 0:
-            print(f"Epoch {epoch+1} Avg Train Loss: {epoch_loss/batch_count:.6f}")
-
-        # Checkpoint & Validate
+            epoch_loss += loss.item()
+            steps += 1
+            if steps % 10 == 0:
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+            
+        # End of Epoch
         if (epoch+1) % 5 == 0:
-            validate(encoder, predictor, dataloader)
-            torch.save(predictor.state_dict(), f"models/predictor_multistep_ep{epoch+1}.pth")
+            torch.save(predictor.state_dict(), f"models/predictor_ep{epoch+1}.pth")
+            validate(encoder, predictor, loader)
 
-    torch.save(predictor.state_dict(), "models/predictor_multistep_final.pth")
+    torch.save(predictor.state_dict(), "models/predictor_final.pth")
     print("Predictor Training Complete.")
 
 if __name__ == "__main__":
