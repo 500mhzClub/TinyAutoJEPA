@@ -96,22 +96,30 @@ def mpc_policy(encoder, predictor, decoder, memory_bank, full_frame, last_steer)
     # 1. Resize whatever we got -> 64x64
     img = cv2.resize(full_frame, (64, 64), interpolation=cv2.INTER_AREA)
 
-    # 2. Normalize
+    # 2. Normalize pixels
     t_img = torch.from_numpy(img).float().to(DEVICE).div(255.0).permute(2, 0, 1).unsqueeze(0)
     
     with torch.no_grad():
-        z_curr = encoder(t_img)
-        z_curr = torch.nn.functional.normalize(z_curr, p=2, dim=1)
+        # IMPORTANT:
+        # - Decoder training + debug_live_vision decode *raw* encoder latents.
+        # - Memory bank similarity expects *normalized* latents (cosine).
+        # We rollout in raw space; normalize only when scoring.
+        z_raw = encoder(t_img)
         
     action_seqs = generate_tentacles(HORIZON, NUM_TENTACLES)
-    z_futures = z_curr.repeat(NUM_TENTACLES, 1) 
+
+    # Rollout in raw latent space
+    z_futures = z_raw.repeat(NUM_TENTACLES, 1)
     total_scores = torch.zeros(NUM_TENTACLES, device=DEVICE)
     
     with torch.no_grad():
         for t in range(HORIZON):
             z_futures = predictor(z_futures, action_seqs[:, t, :])
-            z_norm = torch.nn.functional.normalize(z_futures, p=2, dim=1)
-            similarity = torch.mm(z_norm, memory_bank.T)
+
+            # Normalize ONLY for similarity scoring
+            z_score = torch.nn.functional.normalize(z_futures, p=2, dim=1)
+            similarity = torch.mm(z_score, memory_bank.T)
+
             top_sims, _ = torch.topk(similarity, k=TOP_K, dim=1)
             total_scores += torch.mean(top_sims, dim=1) * (0.9 ** t)
 
@@ -124,13 +132,15 @@ def mpc_policy(encoder, predictor, decoder, memory_bank, full_frame, last_steer)
     recon_now, dream_future = None, None
     if decoder is not None:
         with torch.no_grad():
-            recon_now = decoder(z_curr) 
-            z_vis = z_curr.clone()
+            # Decode raw latents
+            recon_now = decoder(z_raw)
+
+            # Visualize predicted future by rolling out in raw space then decoding
+            z_vis = z_raw.clone()
             for t in range(HORIZON):
                 z_vis = predictor(z_vis, action_seqs[best_idx, t].unsqueeze(0))
             dream_future = decoder(z_vis)
 
-    # Return 'img' (the 64x64 patch) so we can debug it
     return best_action, final_scores[best_idx].item(), recon_now, dream_future, img
 
 def main():
@@ -145,18 +155,15 @@ def main():
     print("\n🏎️ AUTOPILOT ENGAGED")
     print("-------------------------")
     
-    # --- CRITICAL FIX: KEEP BUFFER FRESH DURING WARMUP ---
-    # We must call capture_window() every step to keep PyGame buffer synced.
-    
     print("1. Skipping 'Zoom In' (50 frames)...")
     for _ in range(50):
         env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
-        capture_window(env) # Pump the video buffer
+        capture_window(env)
         
     print("2. 🚀 KICKSTART: Forcing Gas for 20 frames...")
     for _ in range(20):
         env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
-        capture_window(env) # Pump the video buffer
+        capture_window(env)
 
     print("3. CONTROL LOOP START")
     try:
@@ -177,10 +184,8 @@ def main():
             vis_real = cv2.resize(vis_real, (400, 300))
             cv2.putText(vis_real, "LIVE GAME", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             
-            # Visualize the EXACT input the net received
             vis_input = cv2.cvtColor(tiny_input, cv2.COLOR_RGB2BGR)
             vis_input = cv2.resize(vis_input, (100, 100), interpolation=cv2.INTER_NEAREST)
-            # Paste into corner
             vis_real[200:300, 300:400] = vis_input
             cv2.putText(vis_real, "INPUT", (310, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
 
@@ -204,7 +209,6 @@ def main():
                 print("Reset.")
                 env.reset()
                 last_steer = 0.0
-                # Warmup resets too
                 for _ in range(50): 
                     env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
                     capture_window(env)
