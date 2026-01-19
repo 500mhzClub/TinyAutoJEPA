@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-drive_mpc.py — Prior-guided MPC with:
-- decoder/predictor space handling (norm/raw)
-- image-based road costs
-- center-band offroad classifier + recovery
-- NEW: conservative MPC penalties for "too fast into chicanes"
-- NEW: real-speed target governor (reads env.unwrapped.car velocity)
+drive_mpc.py — MPC + world-model rollout + center-band classifier + recovery
+PLUS a speed governor that is not permanently clamping gas
+PLUS optional video recording of the full 3-pane HUD (LIVE / What Net Sees / Prediction).
 
-This addresses the failure mode where the model predicts plausible frames but the real sim spins at high slip.
+Fix in this version:
+- Recon/Dream panels are converted to uint8 (0..255) BEFORE np.hstack with the live uint8 panel.
+  This prevents the float(0..1) panels being crushed to black when recording.
+
+Recording:
+  RECORD=1 enables recording.
+  VIDEO_DIR=videos
+  VIDEO_OUT=mpc_debug.mp4
+  VIDEO_FPS=30
+  VIDEO_FOURCC=mp4v  (fallback to XVID .avi if mp4 writer fails)
+  VIDEO_MAX_FRAMES=0 (0 = unlimited)
 """
 
 import os
@@ -16,6 +23,7 @@ import gymnasium as gym
 import numpy as np
 import pygame
 import torch
+from datetime import datetime
 
 from networks import TinyEncoder, Predictor, TinyDecoder
 
@@ -46,7 +54,7 @@ assert PREDICTOR_SPACE in ("raw", "norm")
 
 
 # -----------------------------
-# Control shaping / sampling
+# Action sampling / shaping
 # -----------------------------
 MOMENTUM = float(os.getenv("MOMENTUM", "0.0"))
 
@@ -54,30 +62,26 @@ STEER_STD = float(os.getenv("STEER_STD", "0.25"))
 STEER_DSTD = float(os.getenv("STEER_DSTD", "0.20"))
 STEER_SMOOTH = float(os.getenv("STEER_SMOOTH", "0.65"))
 
-GAS_BASE = float(os.getenv("GAS_BASE", "0.70"))
-GAS_DROP = float(os.getenv("GAS_DROP", "0.55"))
-MIN_GAS = float(os.getenv("MIN_GAS", "0.18"))
+GAS_BASE = float(os.getenv("GAS_BASE", "0.78"))
+GAS_DROP = float(os.getenv("GAS_DROP", "0.45"))
+MIN_GAS = float(os.getenv("MIN_GAS", "0.22"))
 
-STEER_MAG_PEN = float(os.getenv("STEER_MAG_PEN", "0.06"))
+STEER_MAG_PEN = float(os.getenv("STEER_MAG_PEN", "0.05"))
 STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.05"))
 STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.03"))
-STEER_SAT_PEN = float(os.getenv("STEER_SAT_PEN", "0.25"))
-STEER_SAT_THRESH = float(os.getenv("STEER_SAT_THRESH", "0.85"))
+STEER_SAT_PEN = float(os.getenv("STEER_SAT_PEN", "0.18"))
+STEER_SAT_THRESH = float(os.getenv("STEER_SAT_THRESH", "0.88"))
 
-# NEW: conservative gas penalties (key for chicanes)
-GAS_MEAN_PEN = float(os.getenv("GAS_MEAN_PEN", "0.28"))        # penalize high mean gas
-GAS_TURN_PEN = float(os.getenv("GAS_TURN_PEN", "0.55"))        # penalize gas*|steer|
-GAS_FLIP_PEN = float(os.getenv("GAS_FLIP_PEN", "0.80"))        # penalize gas during steer sign-flips
-
-OVERSPEED_GAS_CAP = float(os.getenv("OVERSPEED_GAS_CAP", "0.45"))
-FLIP_GAS_CAP = float(os.getenv("FLIP_GAS_CAP", "0.35"))
+GAS_MEAN_PEN = float(os.getenv("GAS_MEAN_PEN", "0.08"))
+GAS_TURN_PEN = float(os.getenv("GAS_TURN_PEN", "0.20"))
+GAS_FLIP_PEN = float(os.getenv("GAS_FLIP_PEN", "0.35"))
 
 
 # -----------------------------
 # Prior guidance
 # -----------------------------
 K_PRIOR = float(os.getenv("K_PRIOR", "3.2"))
-PRIOR_W = float(os.getenv("PRIOR_W", "1.4"))
+PRIOR_W = float(os.getenv("PRIOR_W", "1.2"))
 PRIOR_CLAMP = float(os.getenv("PRIOR_CLAMP", "0.75"))
 
 CONF_MIN = float(os.getenv("CONF_MIN", "0.10"))
@@ -93,13 +97,10 @@ IMG_W_NOROAD = float(os.getenv("IMG_W_NOROAD", "3.0"))
 
 ROI_PRIOR = (20, 58, 6, 58)
 ROI_COST = (28, 62, 8, 56)
-
-# Center-band classifier ROI
 ROI_CLASS = (32, 62, 24, 40)
 
 GRASS_BIAS = float(os.getenv("GRASS_BIAS", "0.12"))
 GRASS_SCALE = float(os.getenv("GRASS_SCALE", "0.06"))
-
 MIN_M = float(os.getenv("MIN_M", "0.10"))
 MAX_M = float(os.getenv("MAX_M", "0.90"))
 M_SOFT = float(os.getenv("M_SOFT", "0.05"))
@@ -114,24 +115,28 @@ REC_EXIT_COUNT = int(os.getenv("REC_EXIT_COUNT", "10"))
 
 
 # -----------------------------
-# Speed governor (actual sim speed)
+# Real-speed governor
 # -----------------------------
-# CarRacing uses Box2D units; speed magnitudes ~ 0..30-ish depending.
-# Tune by printing v occasionally if needed.
-V_BASE = float(os.getenv("V_BASE", "18.0"))            # target speed straight
-V_DROP = float(os.getenv("V_DROP", "10.0"))            # reduce target by |steer|
-V_FLIP_DROP = float(os.getenv("V_FLIP_DROP", "6.0"))   # extra reduction on chicane snap
-V_MIN = float(os.getenv("V_MIN", "7.0"))               # minimum target speed
-SPEED_BRAKE_K = float(os.getenv("SPEED_BRAKE_K", "0.09"))  # braking gain when v > v_target
-SPEED_GAS_CAP = float(os.getenv("SPEED_GAS_CAP", "0.72"))  # cap gas even if MPC wants more
+V_BASE = float(os.getenv("V_BASE", "24.0"))
+V_DROP = float(os.getenv("V_DROP", "10.0"))
+V_FLIP_DROP = float(os.getenv("V_FLIP_DROP", "6.0"))
+V_MIN = float(os.getenv("V_MIN", "9.0"))
+
+OVERSPEED_DEADBAND = float(os.getenv("OVERSPEED_DEADBAND", "1.5"))
+SPEED_BRAKE_K = float(os.getenv("SPEED_BRAKE_K", "0.05"))
+SPEED_GAS_CAP = float(os.getenv("SPEED_GAS_CAP", "0.95"))
+OVERSPEED_GAS_CAP = float(os.getenv("OVERSPEED_GAS_CAP", "0.55"))
 
 
 # -----------------------------
-# Flip-brake / snap-oversteer control
+# Flip-brake
 # -----------------------------
 FLIP_STEER_DELTA = float(os.getenv("FLIP_STEER_DELTA", "0.55"))
-FLIP_BRAKE = float(os.getenv("FLIP_BRAKE", "0.45"))
-FLIP_BRAKE_STEPS = int(os.getenv("FLIP_BRAKE_STEPS", "10"))
+FLIP_BRAKE = float(os.getenv("FLIP_BRAKE", "0.40"))
+FLIP_BRAKE_STEPS = int(os.getenv("FLIP_BRAKE_STEPS", "8"))
+FLIP_GAS_CAP = float(os.getenv("FLIP_GAS_CAP", "0.40"))
+FLIP_MIN_SPEED = float(os.getenv("FLIP_MIN_SPEED", "14.0"))
+FLIP_TURN_GATE = float(os.getenv("FLIP_TURN_GATE", "0.18"))
 
 
 # -----------------------------
@@ -142,17 +147,17 @@ REC_SEARCH_STEPS = int(os.getenv("REC_SEARCH_STEPS", "160"))
 REC_REJOIN_STEPS = int(os.getenv("REC_REJOIN_STEPS", "55"))
 
 REC_SEARCH_STEER = float(os.getenv("REC_SEARCH_STEER", "0.55"))
-REC_SEARCH_GAS = float(os.getenv("REC_SEARCH_GAS", "0.66"))
+REC_SEARCH_GAS = float(os.getenv("REC_SEARCH_GAS", "0.70"))
 REC_SEARCH_BRAKE = float(os.getenv("REC_SEARCH_BRAKE", "0.00"))
-REC_SEARCH_BOOST = float(os.getenv("REC_SEARCH_BOOST", "0.10"))
+REC_SEARCH_BOOST = float(os.getenv("REC_SEARCH_BOOST", "0.08"))
 
 REC_REJOIN_K = float(os.getenv("REC_REJOIN_K", "2.0"))
 REC_REJOIN_STEER_CLAMP = float(os.getenv("REC_REJOIN_STEER_CLAMP", "0.70"))
-REC_REJOIN_GAS = float(os.getenv("REC_REJOIN_GAS", "0.72"))
+REC_REJOIN_GAS = float(os.getenv("REC_REJOIN_GAS", "0.74"))
 REC_REJOIN_BRAKE = float(os.getenv("REC_REJOIN_BRAKE", "0.00"))
 
-POST_REC_STEPS = int(os.getenv("POST_REC_STEPS", "40"))
-POST_REC_GAS = float(os.getenv("POST_REC_GAS", "0.50"))
+POST_REC_STEPS = int(os.getenv("POST_REC_STEPS", "30"))
+POST_REC_GAS = float(os.getenv("POST_REC_GAS", "0.55"))
 POST_REC_STEER_CLAMP = float(os.getenv("POST_REC_STEER_CLAMP", "0.55"))
 
 
@@ -161,6 +166,103 @@ POST_REC_STEER_CLAMP = float(os.getenv("POST_REC_STEER_CLAMP", "0.55"))
 # -----------------------------
 VIS_HORIZON = int(os.getenv("VIS_HORIZON", "1"))
 DEBUG_PRINT = int(os.getenv("DEBUG_PRINT", "1")) == 1
+
+
+def _to_uint8_bgr(img: np.ndarray) -> np.ndarray:
+    """Return contiguous uint8 BGR image."""
+    if img is None:
+        return None
+    if img.dtype != np.uint8:
+        m = float(np.nanmax(img)) if img.size else 0.0
+        if m <= 1.5:
+            img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+    return np.ascontiguousarray(img)
+
+
+def _tensor01_to_bgr_u8(t: torch.Tensor, w: int, h: int) -> np.ndarray:
+    """
+    t: (1,C,H,W) or (C,H,W) in [0,1]
+    Returns: uint8 BGR (h,w,3)
+    """
+    x = torch.clamp(t, 0, 1).detach().cpu()
+    if x.dim() == 4:
+        x = x.squeeze(0)
+    x = x.permute(1, 2, 0).numpy()          # HWC, float 0..1
+    x = (x * 255.0).astype(np.uint8)         # uint8 0..255
+    x = cv2.resize(x, (w, h), interpolation=cv2.INTER_AREA)
+    x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+    return np.ascontiguousarray(x)
+
+
+class VideoRecorder:
+    def __init__(self):
+        self.enabled = os.getenv("RECORD", "0") == "1"
+        self.writer = None
+        self.out_path = None
+        self.fps = float(os.getenv("VIDEO_FPS", "30"))
+        self.max_frames = int(os.getenv("VIDEO_MAX_FRAMES", "0"))  # 0 = unlimited
+        self.frame_count = 0
+        self.fourcc_str = os.getenv("VIDEO_FOURCC", "mp4v")
+        self.dir = os.getenv("VIDEO_DIR", "videos")
+
+    def _resolve_out_path(self) -> str:
+        os.makedirs(self.dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.getenv("VIDEO_OUT", "").strip()
+        if not filename:
+            filename = f"run_{ts}.mp4"
+        filename = filename.replace(" ", "_")
+        root, ext = os.path.splitext(filename)
+        if ext.lower() not in (".mp4", ".avi", ".mkv", ".mov"):
+            filename = filename + ".mp4"
+        return filename if os.path.isabs(filename) else os.path.join(self.dir, filename)
+
+    def _open(self, frame_bgr_u8: np.ndarray):
+        self.out_path = self._resolve_out_path()
+        h, w = frame_bgr_u8.shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(*self.fourcc_str)
+        self.writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w, h))
+
+        if not self.writer.isOpened():
+            fallback_path = os.path.splitext(self.out_path)[0] + ".avi"
+            fourcc = cv2.VideoWriter_fourcc(*"XVID")
+            self.writer = cv2.VideoWriter(fallback_path, fourcc, self.fps, (w, h))
+            self.out_path = fallback_path
+
+        if self.writer.isOpened():
+            print(f"[REC] Recording -> {self.out_path} ({w}x{h} @ {self.fps} fps, fourcc={self.fourcc_str})")
+        else:
+            print("[REC] ERROR: VideoWriter could not be opened. Recording disabled.")
+            self.enabled = False
+            self.writer = None
+
+    def write(self, frame_bgr: np.ndarray):
+        if not self.enabled or frame_bgr is None:
+            return
+        frame_u8 = _to_uint8_bgr(frame_bgr)
+        if frame_u8 is None or frame_u8.ndim != 3 or frame_u8.shape[2] != 3:
+            return
+        if self.writer is None:
+            self._open(frame_u8)
+        if self.writer is None:
+            return
+
+        self.writer.write(frame_u8)
+        self.frame_count += 1
+
+        if self.max_frames > 0 and self.frame_count >= self.max_frames:
+            print(f"[REC] Reached VIDEO_MAX_FRAMES={self.max_frames}. Closing.")
+            self.close()
+            self.enabled = False
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+            print(f"[REC] Saved: {self.out_path}")
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -200,7 +302,6 @@ def capture_window(env):
 
 
 def get_speed(env) -> float:
-    """Return speed magnitude if CarRacing internals are present; else 0."""
     try:
         car = env.unwrapped.car
         v = car.hull.linearVelocity
@@ -252,7 +353,6 @@ def _compute_signals(img64_rgb01: torch.Tensor):
 
     steer_prior = float(np.clip(K_PRIOR * err, -PRIOR_CLAMP, PRIOR_CLAMP))
     steer_prior = float(np.clip(steer_prior * conf, -PRIOR_CLAMP, PRIOR_CLAMP))
-
     return steer_prior, err, x_mean, road_m, grass_m, class_road, class_grass, conf
 
 
@@ -279,11 +379,10 @@ def _make_actions(horizon, n, steer_center: float) -> torch.Tensor:
     abs_s = torch.abs(steer_all)
 
     gas = GAS_BASE - GAS_DROP * abs_s
-    gas = torch.clamp(gas, MIN_GAS, 0.90)
+    gas = torch.clamp(gas, MIN_GAS, 0.95)
 
-    brake = torch.zeros_like(gas)
     ramp = torch.clamp((abs_s - 0.55) / (1.0 - 0.55), 0.0, 1.0)
-    brake = torch.clamp(0.20 * ramp, 0.0, 0.20)
+    brake = torch.clamp(0.20 * ramp, 0.0, 0.22)
 
     return torch.stack([steer_all, gas, brake], dim=-1)
 
@@ -316,7 +415,6 @@ def _image_cost_batch(decoded_bchw_01: torch.Tensor) -> torch.Tensor:
     center_offset = torch.abs(x_mean - 0.5)
 
     noroad = torch.relu(0.18 - road_mean)
-
     return (IMG_W_CENTER * center_offset) + (IMG_W_GRASS * grass_mean) + (IMG_W_NOROAD * noroad)
 
 
@@ -343,7 +441,6 @@ def mpc_policy(enc, pred, dec, frame):
 
     prior_pen = (PRIOR_W * conf) * torch.abs(actions[:, 0, 0] - float(steer_prior))
 
-    # NEW: chicane / speed conservatism penalties
     gas_mean_pen = GAS_MEAN_PEN * torch.mean(gas, dim=1)
     gas_turn_pen = GAS_TURN_PEN * torch.mean(gas * torch.abs(steer), dim=1)
     steer_flip_mask = (steer[:, 1:] * steer[:, :-1] < 0).float()
@@ -366,9 +463,12 @@ def mpc_policy(enc, pred, dec, frame):
                 imgs = torch.clamp(dec(z_dec), 0, 1)
                 img_cost_total += _image_cost_batch(imgs)
 
-        score = -img_cost_total \
-                - mag_pen - jerk_pen - flip_pen - sat_pen - prior_pen \
-                - gas_mean_pen - gas_turn_pen - gas_flip_pen
+        score = (
+            -img_cost_total
+            - mag_pen - jerk_pen - flip_pen - sat_pen
+            - prior_pen
+            - gas_mean_pen - gas_turn_pen - gas_flip_pen
+        )
 
         best = torch.argmax(score).item()
         best_action0 = actions[best, 0].detach().cpu().numpy()
@@ -400,11 +500,7 @@ def mpc_policy(enc, pred, dec, frame):
     return best_action0, float(score[best].item()), recon, dream, img64, dbg
 
 
-def apply_real_speed_governor(env, action: np.ndarray, flip_brake_left: int) -> np.ndarray:
-    """
-    Uses actual env speed to keep you out of the spin regime.
-    Target speed drops with |steer| and with flip-brake state.
-    """
+def apply_real_speed_governor(env, action: np.ndarray, flip_left: int):
     steer = float(action[0])
     gas = float(action[1])
     brake = float(action[2])
@@ -412,23 +508,25 @@ def apply_real_speed_governor(env, action: np.ndarray, flip_brake_left: int) -> 
     v = get_speed(env)
 
     v_target = V_BASE - V_DROP * abs(steer)
-    if flip_brake_left > 0:
+    if flip_left > 0:
         v_target -= V_FLIP_DROP
     v_target = float(np.clip(v_target, V_MIN, V_BASE))
 
-    if v > v_target:
-        # brake proportional to overspeed
-        brake = max(brake, float(np.clip(SPEED_BRAKE_K * (v - v_target), 0.0, 0.60)))
+    overspeed = (v > (v_target + OVERSPEED_DEADBAND))
+    if overspeed:
+        over_amt = v - (v_target + OVERSPEED_DEADBAND)
+        brake = max(brake, float(np.clip(SPEED_BRAKE_K * over_amt, 0.0, 0.55)))
         gas = min(gas, OVERSPEED_GAS_CAP)
     else:
         gas = min(gas, SPEED_GAS_CAP)
 
-    return np.array([steer, gas, brake], dtype=np.float32)
+    return np.array([steer, gas, brake], dtype=np.float32), v, v_target, overspeed
 
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
     enc, pred, dec = load_models()
+    rec = VideoRecorder()
 
     env.reset()
     env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
@@ -466,6 +564,7 @@ def main():
                 continue
 
             a0, sc, recon, dream, tiny, dbg = mpc_policy(enc, pred, dec, frame)
+            v_now = get_speed(env)
 
             # Enter recovery
             if (not rec_mode) and (dbg["class_road"] < OFF_ROAD_CLASS):
@@ -489,7 +588,6 @@ def main():
                     exit_good += 1
                 else:
                     exit_good = 0
-
                 if exit_good >= REC_EXIT_COUNT:
                     rec_mode = False
                     rec_phase = 0
@@ -497,11 +595,9 @@ def main():
                     exit_good = 0
                     post_rec_left = POST_REC_STEPS
 
-            # Choose action
             if rec_mode:
                 rec_t += 1
                 mode_str = "REC"
-
                 if rec_phase == 0:
                     action = np.array([0.0, 0.0, 0.60], dtype=np.float32)
                     if rec_t >= REC_STABILIZE_STEPS:
@@ -514,7 +610,7 @@ def main():
                     class_prev = dbg["class_road"]
 
                     steer = rec_turn_sign * REC_SEARCH_STEER
-                    gas = float(np.clip(REC_SEARCH_GAS + boost, 0.0, 0.85))
+                    gas = float(np.clip(REC_SEARCH_GAS + boost, 0.0, 0.88))
                     brake = REC_SEARCH_BRAKE
                     action = np.array([steer, gas, brake], dtype=np.float32)
 
@@ -534,26 +630,32 @@ def main():
                         rec_phase = 1
                         rec_t = 0
 
+                v = get_speed(env)
+                v_tgt = 0.0
+                over = 0
+                flip = 0
+
             else:
                 mode_str = "MPC"
                 steer_cmd = MOMENTUM * last_steer + (1.0 - MOMENTUM) * float(a0[0])
                 steer_cmd = float(np.clip(steer_cmd, -1.0, 1.0))
                 action = np.array([steer_cmd, float(a0[1]), float(a0[2])], dtype=np.float32)
 
-                # Detect snap (chicane sign flip)
-                if (np.sign(last_steer) != np.sign(action[0])) and (abs(action[0] - last_steer) > FLIP_STEER_DELTA):
-                    flip_brake_left = FLIP_BRAKE_STEPS
+                if v_now > FLIP_MIN_SPEED:
+                    turning = (abs(last_steer) > FLIP_TURN_GATE) or (abs(action[0]) > FLIP_TURN_GATE)
+                    big_flip = (np.sign(last_steer) != np.sign(action[0])) and (abs(action[0] - last_steer) > FLIP_STEER_DELTA)
+                    if turning and big_flip:
+                        flip_brake_left = FLIP_BRAKE_STEPS
 
-                # Apply flip-brake pulse first (prevents immediate snap-oversteer)
+                flip = 1 if flip_brake_left > 0 else 0
                 if flip_brake_left > 0:
                     action[2] = max(action[2], FLIP_BRAKE)
                     action[1] = min(action[1], FLIP_GAS_CAP)
                     flip_brake_left -= 1
 
-                # Apply real-speed governor (key mismatch fix)
-                action = apply_real_speed_governor(env, action, flip_brake_left)
+                action, v, v_tgt, overspeed = apply_real_speed_governor(env, action, flip_brake_left)
+                over = 1 if overspeed else 0
 
-                # Post-recovery ramp
                 if post_rec_left > 0:
                     action[0] = float(np.clip(action[0], -POST_REC_STEER_CLAMP, POST_REC_STEER_CLAMP))
                     action[1] = min(action[1], POST_REC_GAS)
@@ -563,19 +665,18 @@ def main():
             last_steer = float(action[0])
 
             _, _, done, trunc, _ = env.step(action)
-
             step_i += 1
+
             if DEBUG_PRINT and step_i % 10 == 0:
-                v = get_speed(env)
-                extra = f" phase={rec_phase} t={rec_t:03d} exit_good={exit_good}" if rec_mode else ""
                 print(
-                    f"step={step_i:05d} mode={mode_str}{extra} v={v:5.2f} "
+                    f"step={step_i:05d} mode={mode_str} v={v:5.2f} vt={v_tgt:5.2f} over={over} flip={flip} "
                     f"steer={action[0]:+.3f} gas={action[1]:.3f} brake={action[2]:.3f} score={sc:+.3f} | "
-                    f"prior={dbg['steer_prior']:+.3f} conf={dbg['conf']:.2f} err={dbg['err']:+.3f} "
-                    f"class_road={dbg['class_road']:.3f}"
+                    f"prior={dbg['steer_prior']:+.3f} conf={dbg['conf']:.2f} err={dbg['err']:+.3f} class_road={dbg['class_road']:.3f}"
                 )
 
-            # HUD panels
+            # -----------------------------
+            # HUD (ALL PANELS -> uint8 BGR BEFORE STACKING)
+            # -----------------------------
             vis_real = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             vis_real = cv2.resize(vis_real, (400, 300))
             cv2.putText(vis_real, "LIVE GAME", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -584,20 +685,21 @@ def main():
             vis_input = cv2.resize(vis_input, (100, 100), interpolation=cv2.INTER_NEAREST)
             vis_real[200:300, 300:400] = vis_input
 
-            r = torch.clamp(recon, 0, 1).squeeze().detach().cpu().permute(1, 2, 0).numpy()
-            r = cv2.resize(r, (400, 300))
-            r = cv2.cvtColor(r, cv2.COLOR_RGB2BGR)
+            # Recon/Dream: float(0..1) -> uint8(0..255) BEFORE stack
+            r = _tensor01_to_bgr_u8(recon, 400, 300)
             cv2.putText(r, "What Net Sees", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-            d = torch.clamp(dream, 0, 1).squeeze().detach().cpu().permute(1, 2, 0).numpy()
-            d = cv2.resize(d, (400, 300))
-            d = cv2.cvtColor(d, cv2.COLOR_RGB2BGR)
+            d = _tensor01_to_bgr_u8(dream, 400, 300)
             cv2.putText(d, "Prediction", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            vis = np.hstack((vis_real, r, d))
+            vis = np.hstack((vis_real, r, d))  # stays uint8 now
             cv2.putText(vis, f"mode={mode_str} score={sc:.3f}", (10, 290),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.imshow("World Model Pilot (conservative MPC + real-speed governor)", vis)
+
+            vis = np.ascontiguousarray(vis, dtype=np.uint8)
+
+            rec.write(vis)
+            cv2.imshow("World Model Pilot (fast governor + flags)", vis)
 
             if cv2.waitKey(1) == 27 or done or trunc:
                 env.reset()
@@ -620,6 +722,7 @@ def main():
                     capture_window(env)
 
     finally:
+        rec.close()
         env.close()
         cv2.destroyAllWindows()
 

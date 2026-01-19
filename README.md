@@ -141,6 +141,10 @@ The final phase implements **Model Predictive Control (MPC)** using an Energy-Ba
 **Execution:**
 
 ```bash
+V_BASE=45 V_DROP=4 V_FLIP_DROP=8 V_MIN=14 \
+RECORD=1 VIDEO_OUT=mpc_debug.mp4 \
+OVERSPEED_DEADBAND=4.0 SPEED_BRAKE_K=0.02 \
+OVERSPEED_GAS_CAP=0.90 SPEED_GAS_CAP=0.99 \
 python drive_mpc.py
 
 ```
