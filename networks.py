@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# --- RESNET-10 ENCODER (UNCHANGED) ---
+# --- RESNET BLOCK (UNCHANGED) ---
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
@@ -21,11 +22,15 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + self.shortcut(x))
 
+# --- TEMPORAL SPATIAL ENCODER ---
+# Input: (B, 12, 64, 64) -> 4 stacked RGB frames
+# Output: (B, 512, 8, 8)
 class TinyEncoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self):
         super().__init__()
+        # 12 channels = 4 frames x 3 channels
         self.in_channels = 64
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(12, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         
@@ -34,8 +39,7 @@ class TinyEncoder(nn.Module):
         self.layer3 = self._make_layer(256, blocks=1, stride=2)
         self.layer4 = self._make_layer(512, blocks=1, stride=2)
         
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.representation_dim = 512
+        self.representation_channels = 512 
 
     def _make_layer(self, out_channels, blocks, stride):
         layers = []
@@ -51,77 +55,87 @@ class TinyEncoder(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = self.avgpool(x)
-        return x.flatten(1)
+        return x 
 
-# --- TINY PROJECTOR (UNCHANGED) ---
+# --- PROJECTOR (UNCHANGED logic) ---
 class Projector(nn.Module):
-    def __init__(self, input_dim=512, hidden_dim=512, output_dim=512):
+    def __init__(self, input_channels=512, hidden_dim=512, output_dim=512):
         super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_channels, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
+        x = self.pool(x).flatten(1)
         return self.net(x)
 
-# --- ROBUST PREDICTOR (The Fix) ---
-# Changes:
-# 1. Residual Connection (z_next = z + delta)
-# 2. LayerNorm on Input and Output (Keeps values stable)
+# --- PREDICTOR (Spatial + Speed Awareness) ---
+# Input: Latent (Spatial), Action (3), Speed (Scalar)
 class Predictor(nn.Module):
-    def __init__(self, input_dim=512, action_dim=3, hidden_dim=512):
+    def __init__(self, action_dim=3, features=512):
         super().__init__()
         
-        self.ln_in = nn.LayerNorm(input_dim)
+        # We append speed to the action vector, so action_input is 3+1=4
+        total_action_dim = action_dim + 1 
         
-        self.net = nn.Sequential(
-            nn.Linear(input_dim + action_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim), # Changed BN to LN for better sequence handling
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, input_dim) 
+        self.conv_in = nn.Conv2d(features + total_action_dim, features, kernel_size=3, padding=1, bias=False)
+        self.bn_in = nn.BatchNorm2d(features)
+        
+        self.res1 = ResidualBlock(features, features)
+        self.res2 = ResidualBlock(features, features)
+        
+        self.conv_out = nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False)
+        
+        # Embed (Action + Speed)
+        self.act_embed = nn.Sequential(
+            nn.Linear(total_action_dim, total_action_dim * 2),
+            nn.ReLU(),
+            nn.Linear(total_action_dim * 2, total_action_dim)
         )
-        
-        self.ln_out = nn.LayerNorm(input_dim)
 
-    def forward(self, z, action):
-        # 1. Normalize input state
-        z_norm = self.ln_in(z)
+    def forward(self, z, action, speed):
+        # z: (B, 512, 8, 8)
+        # action: (B, 3)
+        # speed: (B, 1)
+        B, C, H, W = z.shape
         
-        # 2. Concat state + action
-        x = torch.cat([z_norm, action], dim=1)
+        # 1. Combine Action + Speed
+        # Ensure speed is (B, 1)
+        if speed.dim() == 1: speed = speed.unsqueeze(1)
+        a_vec = torch.cat([action, speed], dim=1) # (B, 4)
         
-        # 3. Predict the CHANGE (delta)
-        delta = self.net(x)
+        # 2. Expand to Spatial Map
+        a_emb = self.act_embed(a_vec)
+        a_map = a_emb.view(B, -1, 1, 1).expand(-1, -1, H, W)
         
-        # 4. Add to original state (Residual Connection)
-        z_next = z + delta
+        # 3. Concat & Convolve
+        x = torch.cat([z, a_map], dim=1)
         
-        # 5. Final safety clamp
-        return self.ln_out(z_next)
+        h = F.relu(self.bn_in(self.conv_in(x)))
+        h = self.res1(h)
+        h = self.res2(h)
+        delta = self.conv_out(h)
+        
+        return z + delta
 
-# --- DECODERS (UNCHANGED) ---
+# --- DECODER (UNCHANGED) ---
+# Reconstructs only the *current* frame (t=0) from the stack features
 class TinyDecoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_channels=512):
         super().__init__()
-        self.fc_input = nn.Linear(latent_dim, 256 * 4 * 4)
         self.net = nn.Sequential(
+            nn.ConvTranspose2d(latent_channels, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(64, 3, kernel_size=3, padding=1),
             nn.Sigmoid()
         )
     def forward(self, z):
-        x = self.fc_input(z)
-        x = x.view(-1, 256, 4, 4)
-        return self.net(x)
+        return self.net(z)

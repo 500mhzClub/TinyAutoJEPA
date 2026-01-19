@@ -1,116 +1,127 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+from torchvision.utils import save_image
 import numpy as np
-import cv2
 import glob
 import os
+import cv2
 import random
-from torchvision.utils import save_image
+from tqdm import tqdm
+
+cv2.setNumThreads(0) 
+
 from networks import TinyEncoder, TinyDecoder
 
-# --- CONFIGURATION ---
+BATCH_SIZE = 1024      
+EPOCHS = 30            
+LR = 1e-3              
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ENCODER_PATH = "./models/encoder_mixed_final.pth"
-DECODER_PATH = "./models/decoder_final.pth"
-DATA_PATTERN = "./data_expert/*.npz" # Only check expert data for now
-BATCH_SIZE   = 8                     # How many examples to check
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FINAL_MODEL_PATH = "models/decoder_final.pth"
 
-def load_models():
-    print(f"Loading Models on {DEVICE}...")
-    
-    # Encoder
-    if not os.path.exists(ENCODER_PATH):
-        raise FileNotFoundError(f"Missing {ENCODER_PATH}")
-    encoder = TinyEncoder().to(DEVICE).eval()
-    encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
-    
-    # Decoder
-    if not os.path.exists(DECODER_PATH):
-        raise FileNotFoundError(f"Missing {DECODER_PATH}")
-    decoder = TinyDecoder().to(DEVICE).eval()
-    decoder.load_state_dict(torch.load(DECODER_PATH, map_location=DEVICE))
-    
-    print("✅ Models Loaded.")
-    return encoder, decoder
+class StreamingDecoderDataset(IterableDataset):
+    def __init__(self):
+        self.files = sorted(glob.glob("./data_*/*.npz"))
+        self.epoch = 0
+        self.total_frames = len(self.files) * 5000 
 
-def get_real_batch(batch_size):
-    """
-    Loads random frames from disk and prepares them EXACTLY like training.
-    """
-    files = glob.glob(DATA_PATTERN)
-    if not files:
-        # Fallback to other folders if expert is missing
-        print("⚠️ data_expert not found, trying data_race...")
-        files = glob.glob("./data_race/*.npz")
-        
-    if not files:
-        raise FileNotFoundError("No data found to verify against!")
-        
-    print(f"Sampling from {len(files)} files...")
-    
-    batch = []
-    while len(batch) < batch_size:
-        f = random.choice(files)
-        try:
-            with np.load(f) as data:
-                if 'states' in data: obs = data['states']
-                elif 'obs' in data: obs = data['obs']
-                else: continue
-            
-            if len(obs) < 1: continue
-            
-            # Pick a random frame
-            idx = random.randint(0, len(obs) - 1)
-            img = obs[idx]
-            
-            # --- CRITICAL PREPROCESSING STEP ---
-            # 1. Resize to 64x64 (Matches Training)
-            if img.shape[0] != 64 or img.shape[1] != 64:
-                img = cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA)
-            
-            # 2. Ensure uint8 (0-255)
-            if img.dtype != np.uint8:
-                if img.max() <= 1.05: img = (img * 255).astype(np.uint8)
-                else: img = img.astype(np.uint8)
-            
-            # 3. Add to batch
-            batch.append(img)
-            
-        except Exception as e:
-            print(f"Skipping bad file {f}: {e}")
-            continue
-            
-    # Convert to Tensor [B, C, H, W] and Normalize 0.0-1.0
-    batch_np = np.array(batch)
-    batch_t = torch.from_numpy(batch_np).float().to(DEVICE)
-    batch_t = batch_t.permute(0, 3, 1, 2).div(255.0)
-    
-    return batch_t
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
-def main():
-    encoder, decoder = load_models()
-    
-    print("Fetching Real Data Batch...")
-    real_imgs = get_real_batch(BATCH_SIZE)
-    
-    print("Running Inference...")
-    with torch.no_grad():
-        # 1. Encode
-        z = encoder(real_imgs)
-        # 2. Decode
-        recon_imgs = decoder(z)
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
         
-    # Stack them: Top Row = Real, Bottom Row = Reconstructed
-    print("Constructing Comparison Image...")
-    comparison = torch.cat([real_imgs, recon_imgs], dim=0)
-    
+        seed = 42 + self.epoch + worker_id
+        np_rng = np.random.default_rng(seed)
+        
+        my_files = self.files[worker_id::num_workers]
+        random.shuffle(my_files)
+        
+        for f in my_files:
+            try:
+                with np.load(f) as data:
+                    if 'states' in data: obs = data['states']
+                    elif 'obs' in data: obs = data['obs']
+                    else: continue
+                
+                if obs.shape[1] != 64:
+                    obs = np.array([cv2.resize(img, (64, 64)) for img in obs])
+                
+                # We need index >= 3 for stacking
+                if len(obs) < 4: continue
+                
+                indices = np_rng.permutation(np.arange(3, len(obs)))
+                
+                for idx in indices:
+                    # Target Image: The current one (idx)
+                    target_img = torch.from_numpy(obs[idx]).float().div_(255.0).permute(2, 0, 1)
+                    
+                    # Input Stack: idx-3 ... idx
+                    stack_frames = obs[idx-3 : idx+1] # 4 frames
+                    stack_t = torch.from_numpy(stack_frames).float().div_(255.0)
+                    stack_t = stack_t.permute(0, 3, 1, 2).reshape(12, 64, 64)
+                    
+                    yield stack_t, target_img
+                    
+            except Exception: continue
+
+    def __len__(self): return self.total_frames
+
+def train():
     os.makedirs("visuals", exist_ok=True)
-    save_path = "visuals/verification_result.png"
-    save_image(comparison, save_path, nrow=BATCH_SIZE)
+    os.makedirs("models", exist_ok=True)
     
-    print(f"\n✅ Verification Complete!")
-    print(f"Check the image at: {save_path}")
-    print("Top Row    = Real Data from Disk")
-    print("Bottom Row = Encoder -> Decoder Reconstruction")
+    encoder = TinyEncoder().to(DEVICE)
+    encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=DEVICE))
+    encoder.eval()
+    for p in encoder.parameters(): p.requires_grad = False
+    
+    decoder = TinyDecoder().to(DEVICE)
+    optimizer = optim.AdamW(decoder.parameters(), lr=LR, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+    scaler = torch.amp.GradScaler('cuda')
+    
+    dataset = StreamingDecoderDataset()
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+    
+    for epoch in range(EPOCHS):
+        dataset.set_epoch(epoch)
+        decoder.train()
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        last_target, last_recon = None, None
+        
+        for stack, target in pbar:
+            stack = stack.to(DEVICE, non_blocking=True)
+            target = target.to(DEVICE, non_blocking=True)
+            
+            optimizer.zero_grad(set_to_none=True)
+            
+            with torch.amp.autocast('cuda'):
+                with torch.no_grad():
+                    z = encoder(stack) # (B, 512, 8, 8)
+                recon = decoder(z)     # (B, 3, 64, 64)
+                loss = criterion(recon, target)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if random.random() < 0.01:
+                last_target, last_recon = target, recon
+        
+        if last_target is not None:
+            comparison = torch.cat([last_target[:8], last_recon[:8]], dim=0)
+            save_image(comparison, f"visuals/decoder_ep{epoch+1}.png", nrow=8)
+
+        torch.save(decoder.state_dict(), f"models/decoder_ep{epoch+1}.pth")
+
+    torch.save(decoder.state_dict(), FINAL_MODEL_PATH)
 
 if __name__ == "__main__":
-    main()
+    train()
