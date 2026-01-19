@@ -13,9 +13,9 @@ GROUNDING_INTERVAL = 1000 # Set high to DISABLE cheating (force pure prediction)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ENCODER_PATH   = "./models/encoder_mixed_final.pth"
-PREDICTOR_PATH = "./models/predictor_multistep_final.pth" 
+PREDICTOR_PATH = "./models/predictor_final.pth" 
 # Checks for ep5 first, falls back to final if 5 isn't there yet
-DECODER_PATH   = "./models/decoder_vicreg_ep5.pth" 
+DECODER_PATH   = "./models/decoder_final.pth" 
 
 def load_models():
     print(f"--- Loading Models on {DEVICE} ---")
@@ -65,8 +65,8 @@ def generate_dream_batch():
     encoder, predictor, decoder = load_models()
 
     # Prefer race data (cleaner), fallback to regular
-    files = glob.glob("./data/*.npz")
-    if not files: files = glob.glob("./data/*.npz")
+    files = glob.glob("./data_expert/*.npz")
+    if not files: files = glob.glob("./data_recover/*.npz")
     if not files: 
         print("❌ No data files found.")
         return

@@ -3,200 +3,214 @@ import torch
 import numpy as np
 import cv2
 import os
+import pygame 
 from networks import TinyEncoder, Predictor, TinyDecoder
 
 # --- CONFIGURATION ---
 MODEL_PATH_ENC    = "./models/encoder_mixed_final.pth"
-MODEL_PATH_PRED   = "./models/predictor_final.pth" # Note: Check if this name matches your saved file
-MODEL_PATH_DEC    = "./models/decoder_final.pth"
+MODEL_PATH_PRED   = "./models/predictor_final.pth" 
+MODEL_PATH_DEC    = "./models/decoder_final.pth" 
 MODEL_PATH_MEMORY = "./models/memory_bank.pt"
 
-# CONTROLLER PHYSICS
-HORIZON       = 10     # Look 10 steps (1.0s) into the future
-NUM_TENTACLES = 128    # More samples = smoother driving
+# MPC PHYSICS
+HORIZON       = 10     
+NUM_TENTACLES = 120    
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# TUNING
-TOP_K         = 20     # Average the top 20 matches (removes outliers)
-STEER_PENALTY = 0.05   # Don't zigzag
-TEMPERATURE   = 0.04   # Lower = More aggressive greedy choice
-MOMENTUM      = 0.60   # High momentum = smoother steering (prevents twitching)
+# AGENT TUNING
+TOP_K         = 20     
+STEER_PENALTY = 0.05   
+MOMENTUM      = 0.60   
 
 def load_models():
     print(f"Loading World Model on {DEVICE}...")
     
-    # Encoder
+    # 1. Encoder (Strict .eval to match debug script)
     enc = TinyEncoder().to(DEVICE).eval()
     enc.load_state_dict(torch.load(MODEL_PATH_ENC, map_location=DEVICE))
     
-    # Predictor
+    # 2. Predictor
     pred = Predictor().to(DEVICE).eval()
-    # Try loading the latest predictor checkpoint
-    try:
+    if os.path.exists(MODEL_PATH_PRED):
         pred.load_state_dict(torch.load(MODEL_PATH_PRED, map_location=DEVICE))
-    except:
-        print(f"⚠️ Could not load {MODEL_PATH_PRED}, trying 'predictor_final.pth'...")
-        pred.load_state_dict(torch.load("models/predictor_final.pth", map_location=DEVICE))
+    elif os.path.exists("./models/predictor_multistep_final.pth"):
+        pred.load_state_dict(torch.load("./models/predictor_multistep_final.pth", map_location=DEVICE))
+    else:
+        raise FileNotFoundError("Could not find a predictor_final.pth file!")
 
-    # Decoder (Optional - For Visualization)
+    # 3. Decoder (Strict .eval)
     dec = TinyDecoder().to(DEVICE).eval()
     if os.path.exists(MODEL_PATH_DEC):
         dec.load_state_dict(torch.load(MODEL_PATH_DEC, map_location=DEVICE))
-        print("✅ Decoder Loaded (Dream View Enabled)")
     else:
-        print("⚠️ Decoder NOT found. You won't see the imagination bubble.")
         dec = None
         
-    # Memory Bank
     if not os.path.exists(MODEL_PATH_MEMORY):
         raise FileNotFoundError("Run make_memory_bank.py first!")
     bank = torch.load(MODEL_PATH_MEMORY, map_location=DEVICE)
-    # Ensure bank is normalized
     bank = torch.nn.functional.normalize(bank, p=2, dim=1)
     
     return enc, pred, dec, bank
 
 def generate_tentacles(horizon, num_tentacles):
-    """
-    Generates random action sequences.
-    """
     actions = torch.zeros(num_tentacles, horizon, 3, device=DEVICE)
-    
-    # 1. Straight & Gentle Turns (Gaussian)
     steer_dist = torch.randn(num_tentacles, device=DEVICE) * 0.5
     steer_dist = torch.clamp(steer_dist, -1.0, 1.0)
     
-    # 2. Hard Left/Right (Uniform) - To cover extremes
     num_uniform = num_tentacles // 4
     steer_dist[:num_uniform] = torch.rand(num_uniform, device=DEVICE) * 2 - 1
     
     for i in range(num_tentacles):
         s = steer_dist[i]
         actions[i, :, 0] = s
-        
-        # Physics Logic: Slow down for turns
         if abs(s) > 0.4:   
-            actions[i, :, 1] = 0.0  # Gas
-            actions[i, :, 2] = 0.2  # Brake
+            actions[i, :, 1] = 0.0 
+            actions[i, :, 2] = 0.2 
         else:                  
-            actions[i, :, 1] = 0.4  # Gas
-            actions[i, :, 2] = 0.0  # Brake
-            
+            actions[i, :, 1] = 0.6 
+            actions[i, :, 2] = 0.0
     return actions
 
-def mpc_policy(encoder, predictor, decoder, memory_bank, current_frame, last_steer):
-    # Prepare Input
-    img = cv2.resize(current_frame, (64, 64))
+def capture_window(env):
+    """
+    Robust dynamic resolution capture.
+    """
+    raw_surface = env.unwrapped.screen
+    if raw_surface is None: return None
+    
+    # 1. Ask PyGame for the REAL resolution
+    w, h = raw_surface.get_size()
+    
+    # 2. Use array3d (Safe copy, no lock)
+    frame_t = pygame.surfarray.array3d(raw_surface)
+    
+    # 3. Transpose to (Height, Width, 3) for OpenCV/Torch
+    frame = frame_t.transpose(1, 0, 2)
+    
+    # 4. Force contiguous memory
+    frame = np.ascontiguousarray(frame, dtype=np.uint8)
+    
+    return frame
+
+def mpc_policy(encoder, predictor, decoder, memory_bank, full_frame, last_steer):
+    # 1. Resize whatever we got -> 64x64
+    img = cv2.resize(full_frame, (64, 64), interpolation=cv2.INTER_AREA)
+
+    # 2. Normalize
     t_img = torch.from_numpy(img).float().to(DEVICE).div(255.0).permute(2, 0, 1).unsqueeze(0)
     
-    # 1. Encode Reality
     with torch.no_grad():
         z_curr = encoder(t_img)
         z_curr = torch.nn.functional.normalize(z_curr, p=2, dim=1)
         
     action_seqs = generate_tentacles(HORIZON, NUM_TENTACLES)
-    
-    # Expand z_curr to match batch size
     z_futures = z_curr.repeat(NUM_TENTACLES, 1) 
     total_scores = torch.zeros(NUM_TENTACLES, device=DEVICE)
     
-    # 2. Simulate All Tentacles (The "Dream")
     with torch.no_grad():
         for t in range(HORIZON):
-            # Predict next state
             z_futures = predictor(z_futures, action_seqs[:, t, :])
             z_norm = torch.nn.functional.normalize(z_futures, p=2, dim=1)
-            
-            # Compare to Expert Memory (Cosine Similarity)
-            # Matrix Multiply: [Batch, 512] x [512, BankSize] = [Batch, BankSize]
-            similarity_matrix = torch.mm(z_norm, memory_bank.T)
-            
-            # Take average of top K matches (Robustness)
-            top_sims, _ = torch.topk(similarity_matrix, k=TOP_K, dim=1)
-            step_score = torch.mean(top_sims, dim=1)
-            
-            # Discount future steps (Immediate future matters more)
-            total_scores += step_score * (0.9 ** t)
+            similarity = torch.mm(z_norm, memory_bank.T)
+            top_sims, _ = torch.topk(similarity, k=TOP_K, dim=1)
+            total_scores += torch.mean(top_sims, dim=1) * (0.9 ** t)
 
-    # 3. Pick Winner
-    # Penalize changing steering too abruptly
     steer_diff = torch.abs(action_seqs[:, 0, 0] - last_steer)
     final_scores = total_scores - (steer_diff * STEER_PENALTY)
     
     best_idx = torch.argmax(final_scores)
     best_action = action_seqs[best_idx, 0].cpu().numpy()
     
-    # 4. DREAM VISUALIZATION (Optional)
-    dream_frame = None
+    recon_now, dream_future = None, None
     if decoder is not None:
         with torch.no_grad():
-            # Rollout the WINNING path again to generate the image
+            recon_now = decoder(z_curr) 
             z_vis = z_curr.clone()
             for t in range(HORIZON):
                 z_vis = predictor(z_vis, action_seqs[best_idx, t].unsqueeze(0))
-            
-            # Decode the final thought
-            dream_frame = decoder(z_vis)
+            dream_future = decoder(z_vis)
 
-    # Calculate confidence for HUD
-    confidence = final_scores[best_idx].item()
-    return best_action, confidence, dream_frame
+    # Return 'img' (the 64x64 patch) so we can debug it
+    return best_action, final_scores[best_idx].item(), recon_now, dream_future, img
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
-    encoder, predictor, decoder, memory_bank = load_models()
+    enc, pred, dec, bank = load_models()
     
-    obs, _ = env.reset()
+    env.reset() 
+    env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32)) 
+    
     last_steer = 0.0
     
-    print("\n🚗 MPC AUTOPILOT ENGAGED")
+    print("\n🏎️ AUTOPILOT ENGAGED")
     print("-------------------------")
-    print("Red Line   = Reality Steering")
-    print("Blue Image = What the car is imagining (T+10)")
     
+    # --- CRITICAL FIX: KEEP BUFFER FRESH DURING WARMUP ---
+    # We must call capture_window() every step to keep PyGame buffer synced.
+    
+    print("1. Skipping 'Zoom In' (50 frames)...")
+    for _ in range(50):
+        env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
+        capture_window(env) # Pump the video buffer
+        
+    print("2. 🚀 KICKSTART: Forcing Gas for 20 frames...")
+    for _ in range(20):
+        env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
+        capture_window(env) # Pump the video buffer
+
+    print("3. CONTROL LOOP START")
     try:
         while True:
-            # Run Policy
-            action, score, dream_img = mpc_policy(
-                encoder, predictor, decoder, memory_bank, obs, last_steer
-            )
+            full_frame = capture_window(env)
+            if full_frame is None: continue
             
-            # Smooth controls
+            action, score, recon, dream, tiny_input = mpc_policy(enc, pred, dec, bank, full_frame, last_steer)
+            
             steer = (MOMENTUM * last_steer) + ((1 - MOMENTUM) * action[0])
-            final_action = [steer, action[1], action[2]]
+            final_action = np.array([steer, action[1], action[2]], dtype=np.float32)
             
-            # Step Environment
-            obs, _, done, trunc, _ = env.step(final_action)
+            _, _, done, trunc, _ = env.step(final_action)
             last_steer = steer
             
-            # --- VISUALIZATION HUD ---
-            # 1. Real Camera
-            vis_real = cv2.resize(obs, (400, 400))
-            cv2.putText(vis_real, f"Score: {score:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+            # --- HUD ---
+            vis_real = cv2.cvtColor(full_frame, cv2.COLOR_RGB2BGR)
+            vis_real = cv2.resize(vis_real, (400, 300))
+            cv2.putText(vis_real, "LIVE GAME", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             
-            # Draw Steering Bar
-            center_x = 200
-            end_x = int(center_x + (steer * 100))
-            cv2.line(vis_real, (center_x, 350), (end_x, 350), (0, 0, 255), 8)
-            
-            # 2. Dream Camera
-            if dream_img is not None:
-                d_img = dream_img.squeeze().cpu().permute(1, 2, 0).numpy()
-                d_img = cv2.resize(d_img, (400, 400))
-                d_img = cv2.cvtColor(d_img, cv2.COLOR_RGB2BGR)
-                cv2.putText(d_img, "DREAM (T+10)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
-                
-                # Stack Side-by-Side
-                hud = np.hstack((vis_real, d_img))
-            else:
-                hud = vis_real
+            # Visualize the EXACT input the net received
+            vis_input = cv2.cvtColor(tiny_input, cv2.COLOR_RGB2BGR)
+            vis_input = cv2.resize(vis_input, (100, 100), interpolation=cv2.INTER_NEAREST)
+            # Paste into corner
+            vis_real[200:300, 300:400] = vis_input
+            cv2.putText(vis_real, "INPUT", (310, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
 
-            cv2.imshow("World Model Pilot", hud)
-            if cv2.waitKey(1) == 27: break # ESC to quit
-            
-            if done or trunc:
-                obs, _ = env.reset()
+            if recon is not None and dream is not None:
+                r_img = torch.clamp(recon, 0, 1).squeeze().cpu().permute(1, 2, 0).numpy()
+                r_img = cv2.resize(r_img, (400, 300))
+                r_img = cv2.cvtColor(r_img, cv2.COLOR_RGB2BGR)
+                cv2.putText(r_img, "What Net Sees", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                
+                d_img = torch.clamp(dream, 0, 1).squeeze().cpu().permute(1, 2, 0).numpy()
+                d_img = cv2.resize(d_img, (400, 300))
+                d_img = cv2.cvtColor(d_img, cv2.COLOR_RGB2BGR)
+                cv2.putText(d_img, "Prediction", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                
+                vis = np.hstack((vis_real, r_img, d_img))
+            else:
+                vis = vis_real
+
+            cv2.imshow("World Model Pilot", vis)
+            if cv2.waitKey(1) == 27 or done or trunc: 
+                print("Reset.")
+                env.reset()
                 last_steer = 0.0
+                # Warmup resets too
+                for _ in range(50): 
+                    env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
+                    capture_window(env)
+                for _ in range(20): 
+                    env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
+                    capture_window(env)
 
     except KeyboardInterrupt:
         pass
