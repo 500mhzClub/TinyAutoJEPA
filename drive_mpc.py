@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-drive_mpc.py — MPC + world-model rollout + center-band classifier + recovery
-PLUS a speed governor that is not permanently clamping gas
-PLUS optional video recording of the full 3-pane HUD (LIVE / What Net Sees / Prediction).
-
-Fix in this version:
-- Recon/Dream panels are converted to uint8 (0..255) BEFORE np.hstack with the live uint8 panel.
-  This prevents the float(0..1) panels being crushed to black when recording.
-
-Recording:
-  RECORD=1 enables recording.
-  VIDEO_DIR=videos
-  VIDEO_OUT=mpc_debug.mp4
-  VIDEO_FPS=30
-  VIDEO_FOURCC=mp4v  (fallback to XVID .avi if mp4 writer fails)
-  VIDEO_MAX_FRAMES=0 (0 = unlimited)
-"""
+from __future__ import annotations
 
 import os
 import cv2
@@ -23,348 +7,157 @@ import gymnasium as gym
 import numpy as np
 import pygame
 import torch
-from datetime import datetime
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
+from typing import Dict, Tuple, Optional, List
 
-from networks import TinyEncoder, Predictor, TinyDecoder
+"""
+drive_mpc.py — “Pure latent MPC” for CarRacing-v3
 
+FINAL CONFIG:
+- Standard Physics (No Inversions)
+- Robust Model Loading
+- Active Prior for Lane Keeping
+"""
 
 # -----------------------------
 # Paths / Device
 # -----------------------------
-MODEL_PATH_ENC = "./models/encoder_mixed_final.pth"
-MODEL_PATH_PRED = "./models/predictor_final.pth"
-MODEL_PATH_DEC = "./models/decoder_final.pth"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_PATH_ENC   = os.getenv("MODEL_PATH_ENC",   "./models/encoder_mixed_final.pth")
+MODEL_PATH_PRED  = os.getenv("MODEL_PATH_PRED",  "./models/predictor_final.pth")
+MODEL_PATH_DEC   = os.getenv("MODEL_PATH_DEC",   "./models/decoder_final.pth")   
+MODEL_PATH_HEADS = os.getenv("MODEL_PATH_HEADS", "./models/latent_heads.pth")    
 
+DEVICE = torch.device(os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+FRAME_STACK = int(os.getenv("FRAME_STACK", "4"))
+PREDICTOR_SPACE = os.getenv("PREDICTOR_SPACE", "raw").lower()
 
 # -----------------------------
-# MPC / rollout
+# MPC parameters
 # -----------------------------
 HORIZON = int(os.getenv("HORIZON", "14"))
-NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "256"))
+NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "128"))
 
-DECODE_STEPS = os.getenv("DECODE_STEPS", "2,4,7,10,14")
-DECODE_STEPS = [int(x) for x in DECODE_STEPS.split(",") if x.strip()]
-DECODE_STEPS = [s for s in DECODE_STEPS if 1 <= s <= HORIZON]
-if not DECODE_STEPS:
-    DECODE_STEPS = [HORIZON]
-
-PREDICTOR_SPACE = os.getenv("PREDICTOR_SPACE", "norm").lower()
-assert PREDICTOR_SPACE in ("raw", "norm")
-
-
-# -----------------------------
-# Action sampling / shaping
-# -----------------------------
-MOMENTUM = float(os.getenv("MOMENTUM", "0.0"))
-
-STEER_STD = float(os.getenv("STEER_STD", "0.25"))
-STEER_DSTD = float(os.getenv("STEER_DSTD", "0.20"))
-STEER_SMOOTH = float(os.getenv("STEER_SMOOTH", "0.65"))
+STEER_STD    = float(os.getenv("STEER_STD", "0.5"))
+STEER_DSTD   = float(os.getenv("STEER_DSTD", "0.20"))
+STEER_SMOOTH = float(os.getenv("STEER_SMOOTH", "0.1"))
 
 GAS_BASE = float(os.getenv("GAS_BASE", "0.78"))
 GAS_DROP = float(os.getenv("GAS_DROP", "0.45"))
-MIN_GAS = float(os.getenv("MIN_GAS", "0.22"))
+MIN_GAS  = float(os.getenv("MIN_GAS", "0.22"))
 
-STEER_MAG_PEN = float(os.getenv("STEER_MAG_PEN", "0.05"))
-STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.05"))
-STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.03"))
-STEER_SAT_PEN = float(os.getenv("STEER_SAT_PEN", "0.18"))
-STEER_SAT_THRESH = float(os.getenv("STEER_SAT_THRESH", "0.88"))
+STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.0"))
+STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.0"))
+STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.0"))
 
-GAS_MEAN_PEN = float(os.getenv("GAS_MEAN_PEN", "0.08"))
-GAS_TURN_PEN = float(os.getenv("GAS_TURN_PEN", "0.20"))
-GAS_FLIP_PEN = float(os.getenv("GAS_FLIP_PEN", "0.35"))
+W_CENTER  = float(os.getenv("W_CENTER", "10.0"))
+W_OFFROAD = float(os.getenv("W_OFFROAD", "0.0")) 
+ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.20"))
+W_SPEED = float(os.getenv("W_SPEED", "1.0"))
 
+V_BASE  = float(os.getenv("V_BASE", "12.0"))
+V_DROP  = float(os.getenv("V_DROP", "10.0"))
+V_MIN   = float(os.getenv("V_MIN", "9.0"))
 
-# -----------------------------
-# Prior guidance
-# -----------------------------
-K_PRIOR = float(os.getenv("K_PRIOR", "3.2"))
-PRIOR_W = float(os.getenv("PRIOR_W", "1.2"))
-PRIOR_CLAMP = float(os.getenv("PRIOR_CLAMP", "0.75"))
+K_PRIOR = float(os.getenv("K_PRIOR", "0.0"))
 
-CONF_MIN = float(os.getenv("CONF_MIN", "0.10"))
-CONF_MAX = float(os.getenv("CONF_MAX", "0.28"))
+DECODE_STEPS = os.getenv("DECODE_STEPS", "2,6,10")
+DECODE_STEPS = [int(x) for x in DECODE_STEPS.split(",") if x.strip()]
+DECODE_STEPS = [s for s in DECODE_STEPS if 1 <= s <= HORIZON]
 
-
-# -----------------------------
-# Image metrics
-# -----------------------------
-IMG_W_CENTER = float(os.getenv("IMG_W_CENTER", "5.0"))
-IMG_W_GRASS = float(os.getenv("IMG_W_GRASS", "5.0"))
-IMG_W_NOROAD = float(os.getenv("IMG_W_NOROAD", "3.0"))
-
-ROI_PRIOR = (20, 58, 6, 58)
-ROI_COST = (28, 62, 8, 56)
-ROI_CLASS = (32, 62, 24, 40)
-
-GRASS_BIAS = float(os.getenv("GRASS_BIAS", "0.12"))
-GRASS_SCALE = float(os.getenv("GRASS_SCALE", "0.06"))
-MIN_M = float(os.getenv("MIN_M", "0.10"))
-MAX_M = float(os.getenv("MAX_M", "0.90"))
-M_SOFT = float(os.getenv("M_SOFT", "0.05"))
-
-
-# -----------------------------
-# Recovery gating
-# -----------------------------
-OFF_ROAD_CLASS = float(os.getenv("OFF_ROAD_CLASS", "0.085"))
-REC_EXIT_CLASS = float(os.getenv("REC_EXIT_CLASS", "0.200"))
-REC_EXIT_COUNT = int(os.getenv("REC_EXIT_COUNT", "10"))
-
-
-# -----------------------------
-# Real-speed governor
-# -----------------------------
-V_BASE = float(os.getenv("V_BASE", "24.0"))
-V_DROP = float(os.getenv("V_DROP", "10.0"))
-V_FLIP_DROP = float(os.getenv("V_FLIP_DROP", "6.0"))
-V_MIN = float(os.getenv("V_MIN", "9.0"))
-
-OVERSPEED_DEADBAND = float(os.getenv("OVERSPEED_DEADBAND", "1.5"))
-SPEED_BRAKE_K = float(os.getenv("SPEED_BRAKE_K", "0.05"))
-SPEED_GAS_CAP = float(os.getenv("SPEED_GAS_CAP", "0.95"))
-OVERSPEED_GAS_CAP = float(os.getenv("OVERSPEED_GAS_CAP", "0.55"))
-
-
-# -----------------------------
-# Flip-brake
-# -----------------------------
-FLIP_STEER_DELTA = float(os.getenv("FLIP_STEER_DELTA", "0.55"))
-FLIP_BRAKE = float(os.getenv("FLIP_BRAKE", "0.40"))
-FLIP_BRAKE_STEPS = int(os.getenv("FLIP_BRAKE_STEPS", "8"))
-FLIP_GAS_CAP = float(os.getenv("FLIP_GAS_CAP", "0.40"))
-FLIP_MIN_SPEED = float(os.getenv("FLIP_MIN_SPEED", "14.0"))
-FLIP_TURN_GATE = float(os.getenv("FLIP_TURN_GATE", "0.18"))
-
-
-# -----------------------------
-# Recovery state machine
-# -----------------------------
-REC_STABILIZE_STEPS = int(os.getenv("REC_STABILIZE_STEPS", "10"))
-REC_SEARCH_STEPS = int(os.getenv("REC_SEARCH_STEPS", "160"))
-REC_REJOIN_STEPS = int(os.getenv("REC_REJOIN_STEPS", "55"))
-
-REC_SEARCH_STEER = float(os.getenv("REC_SEARCH_STEER", "0.55"))
-REC_SEARCH_GAS = float(os.getenv("REC_SEARCH_GAS", "0.70"))
-REC_SEARCH_BRAKE = float(os.getenv("REC_SEARCH_BRAKE", "0.00"))
-REC_SEARCH_BOOST = float(os.getenv("REC_SEARCH_BOOST", "0.08"))
-
-REC_REJOIN_K = float(os.getenv("REC_REJOIN_K", "2.0"))
-REC_REJOIN_STEER_CLAMP = float(os.getenv("REC_REJOIN_STEER_CLAMP", "0.70"))
-REC_REJOIN_GAS = float(os.getenv("REC_REJOIN_GAS", "0.74"))
-REC_REJOIN_BRAKE = float(os.getenv("REC_REJOIN_BRAKE", "0.00"))
-
-POST_REC_STEPS = int(os.getenv("POST_REC_STEPS", "30"))
-POST_REC_GAS = float(os.getenv("POST_REC_GAS", "0.55"))
-POST_REC_STEER_CLAMP = float(os.getenv("POST_REC_STEER_CLAMP", "0.55"))
-
-
-# -----------------------------
-# Visualization / debug
-# -----------------------------
-VIS_HORIZON = int(os.getenv("VIS_HORIZON", "1"))
 DEBUG_PRINT = int(os.getenv("DEBUG_PRINT", "1")) == 1
+RECORD = int(os.getenv("RECORD", "0")) == 1
+VIDEO_DIR = os.getenv("VIDEO_DIR", "videos")
+VIDEO_OUT = os.getenv("VIDEO_OUT", "mpc_run.mp4")
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
+VIDEO_FOURCC = os.getenv("VIDEO_FOURCC", "mp4v")
 
+# -----------------------------
+# Imports
+# -----------------------------
+from networks import TinyEncoder, Predictor, TinyDecoder
 
-def _to_uint8_bgr(img: np.ndarray) -> np.ndarray:
-    """Return contiguous uint8 BGR image."""
-    if img is None:
-        return None
-    if img.dtype != np.uint8:
-        m = float(np.nanmax(img)) if img.size else 0.0
-        if m <= 1.5:
-            img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-        else:
-            img = np.clip(img, 0.0, 255.0).astype(np.uint8)
-    return np.ascontiguousarray(img)
+def _strip_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in state_dict.items():
+        k = k.replace("_orig_mod.", "").replace("module.", "")
+        out[k] = v
+    return out
 
+def _l2norm_bchw(z: torch.Tensor) -> torch.Tensor:
+    return F.normalize(z, p=2, dim=1)
 
-def _tensor01_to_bgr_u8(t: torch.Tensor, w: int, h: int) -> np.ndarray:
-    """
-    t: (1,C,H,W) or (C,H,W) in [0,1]
-    Returns: uint8 BGR (h,w,3)
-    """
-    x = torch.clamp(t, 0, 1).detach().cpu()
-    if x.dim() == 4:
-        x = x.squeeze(0)
-    x = x.permute(1, 2, 0).numpy()          # HWC, float 0..1
-    x = (x * 255.0).astype(np.uint8)         # uint8 0..255
-    x = cv2.resize(x, (w, h), interpolation=cv2.INTER_AREA)
-    x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
-    return np.ascontiguousarray(x)
+def pool_feat(z_bchw: torch.Tensor) -> torch.Tensor:
+    return F.adaptive_avg_pool2d(z_bchw, 1).flatten(1)
 
-
-class VideoRecorder:
-    def __init__(self):
-        self.enabled = os.getenv("RECORD", "0") == "1"
-        self.writer = None
-        self.out_path = None
-        self.fps = float(os.getenv("VIDEO_FPS", "30"))
-        self.max_frames = int(os.getenv("VIDEO_MAX_FRAMES", "0"))  # 0 = unlimited
-        self.frame_count = 0
-        self.fourcc_str = os.getenv("VIDEO_FOURCC", "mp4v")
-        self.dir = os.getenv("VIDEO_DIR", "videos")
-
-    def _resolve_out_path(self) -> str:
-        os.makedirs(self.dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.getenv("VIDEO_OUT", "").strip()
-        if not filename:
-            filename = f"run_{ts}.mp4"
-        filename = filename.replace(" ", "_")
-        root, ext = os.path.splitext(filename)
-        if ext.lower() not in (".mp4", ".avi", ".mkv", ".mov"):
-            filename = filename + ".mp4"
-        return filename if os.path.isabs(filename) else os.path.join(self.dir, filename)
-
-    def _open(self, frame_bgr_u8: np.ndarray):
-        self.out_path = self._resolve_out_path()
-        h, w = frame_bgr_u8.shape[:2]
-
-        fourcc = cv2.VideoWriter_fourcc(*self.fourcc_str)
-        self.writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w, h))
-
-        if not self.writer.isOpened():
-            fallback_path = os.path.splitext(self.out_path)[0] + ".avi"
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-            self.writer = cv2.VideoWriter(fallback_path, fourcc, self.fps, (w, h))
-            self.out_path = fallback_path
-
-        if self.writer.isOpened():
-            print(f"[REC] Recording -> {self.out_path} ({w}x{h} @ {self.fps} fps, fourcc={self.fourcc_str})")
-        else:
-            print("[REC] ERROR: VideoWriter could not be opened. Recording disabled.")
-            self.enabled = False
-            self.writer = None
-
-    def write(self, frame_bgr: np.ndarray):
-        if not self.enabled or frame_bgr is None:
-            return
-        frame_u8 = _to_uint8_bgr(frame_bgr)
-        if frame_u8 is None or frame_u8.ndim != 3 or frame_u8.shape[2] != 3:
-            return
-        if self.writer is None:
-            self._open(frame_u8)
-        if self.writer is None:
-            return
-
-        self.writer.write(frame_u8)
-        self.frame_count += 1
-
-        if self.max_frames > 0 and self.frame_count >= self.max_frames:
-            print(f"[REC] Reached VIDEO_MAX_FRAMES={self.max_frames}. Closing.")
-            self.close()
-            self.enabled = False
-
-    def close(self):
-        if self.writer is not None:
-            self.writer.release()
-            self.writer = None
-            print(f"[REC] Saved: {self.out_path}")
-
-
-def _l2norm(x: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.normalize(x, p=2, dim=1)
-
-
-def _sigmoid(x: torch.Tensor) -> torch.Tensor:
-    return 1.0 / (1.0 + torch.exp(-x))
-
-
-def load_models():
-    for p in (MODEL_PATH_ENC, MODEL_PATH_PRED, MODEL_PATH_DEC):
-        if not os.path.exists(p):
-            raise FileNotFoundError(p)
-
-    enc = TinyEncoder().to(DEVICE).eval()
-    enc.load_state_dict(torch.load(MODEL_PATH_ENC, map_location=DEVICE))
-
-    pred = Predictor().to(DEVICE).eval()
-    pred.load_state_dict(torch.load(MODEL_PATH_PRED, map_location=DEVICE))
-
-    dec = TinyDecoder().to(DEVICE).eval()
-    dec.load_state_dict(torch.load(MODEL_PATH_DEC, map_location=DEVICE))
-
-    print(f"Loaded models on {DEVICE}")
-    print(f"PREDICTOR_SPACE={PREDICTOR_SPACE} H={HORIZON} N={NUM_TENTACLES} DECODE_STEPS={DECODE_STEPS}")
-    return enc, pred, dec
-
-
-def capture_window(env):
-    surf = env.unwrapped.screen
-    if surf is None:
-        return None
-    frame_t = pygame.surfarray.array3d(surf)
-    frame = frame_t.transpose(1, 0, 2)
-    return np.ascontiguousarray(frame, dtype=np.uint8)
-
-
-def get_speed(env) -> float:
+def capture_window(env) -> Optional[np.ndarray]:
     try:
-        car = env.unwrapped.car
-        v = car.hull.linearVelocity
-        return float(np.sqrt(v[0] * v[0] + v[1] * v[1]))
-    except Exception:
-        return 0.0
+        surf = env.unwrapped.screen
+        if surf is not None:
+            frame_t = pygame.surfarray.array3d(surf)
+            frame = frame_t.transpose(1, 0, 2)
+            return np.ascontiguousarray(frame, dtype=np.uint8)
+    except: pass
+    try:
+        fr = env.render()
+        if fr is None: return None
+        return np.ascontiguousarray(fr, dtype=np.uint8)
+    except: return None
 
+def _rgb64_u8(frame_rgb: np.ndarray) -> np.ndarray:
+    img64 = cv2.resize(frame_rgb, (64, 64), interpolation=cv2.INTER_AREA)
+    if img64.dtype != np.uint8: img64 = np.clip(img64, 0, 255).astype(np.uint8)
+    return img64
 
-def _soft_road_stats(img64_rgb01: torch.Tensor, roi):
-    y1, y2, x1, x2 = roi
-    roi_t = img64_rgb01[:, :, y1:y2, x1:x2]
-    r = roi_t[:, 0]
-    g = roi_t[:, 1]
-    b = roi_t[:, 2]
-    m = (r + g + b) / 3.0
+def _stack_to_tensor_u8(stack: np.ndarray) -> torch.Tensor:
+    t = torch.from_numpy(stack).permute(0, 3, 1, 2).contiguous() 
+    fr = t.reshape(3 * stack.shape[0], 64, 64)
+    return fr.unsqueeze(0).to(torch.uint8)
 
-    green_index = g - 0.5 * (r + b)
-    grassness = _sigmoid((green_index - GRASS_BIAS) / GRASS_SCALE)
+class MLPHead(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-    gate_lo = _sigmoid((m - MIN_M) / M_SOFT)
-    gate_hi = _sigmoid((MAX_M - m) / M_SOFT)
-    bright_gate = gate_lo * gate_hi
+@torch.no_grad()
+def heads_eval(head_road, head_spd, head_xoff, feat512):
+    road = torch.sigmoid(head_road(feat512))
+    spd  = head_spd(feat512)
+    xoff = torch.tanh(head_xoff(feat512)) * 0.5
+    return road, spd, xoff
 
-    road_w = (1.0 - grassness) * bright_gate
-    grass_w = grassness * bright_gate
+@torch.no_grad()
+def encoder_latent(enc: nn.Module, x_u8: torch.Tensor) -> torch.Tensor:
+    x = x_u8.to(device=DEVICE, dtype=torch.float32) / 255.0
+    z = enc(x)
+    if PREDICTOR_SPACE == "norm": z = _l2norm_bchw(z)
+    return z
 
-    road_mean = road_w.mean(dim=(1, 2))
-    grass_mean = grass_w.mean(dim=(1, 2))
+def _pred_step(pred: nn.Module, z_bchw: torch.Tensor, action: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
+    try: return pred(z_bchw, action, speed)
+    except TypeError: return pred(z_bchw, action)
 
-    _, h, w = road_w.shape
-    xs = torch.linspace(0, 1, w, device=img64_rgb01.device)[None, None, :].repeat(1, h, 1)
-    denom = road_w.sum(dim=(1, 2)).clamp(min=1e-6)
-    x_mean = (road_w * xs).sum(dim=(1, 2)) / denom
-
-    return float(x_mean.item()), float(road_mean.item()), float(grass_mean.item())
-
-
-def _conf_from_class(class_road: float) -> float:
-    denom = max(1e-6, (CONF_MAX - CONF_MIN))
-    return float(np.clip((class_road - CONF_MIN) / denom, 0.0, 1.0))
-
-
-def _compute_signals(img64_rgb01: torch.Tensor):
-    x_mean, road_m, grass_m = _soft_road_stats(img64_rgb01, ROI_PRIOR)
-    err = x_mean - 0.5
-
-    _, class_road, class_grass = _soft_road_stats(img64_rgb01, ROI_CLASS)
-    conf = _conf_from_class(class_road)
-
-    steer_prior = float(np.clip(K_PRIOR * err, -PRIOR_CLAMP, PRIOR_CLAMP))
-    steer_prior = float(np.clip(steer_prior * conf, -PRIOR_CLAMP, PRIOR_CLAMP))
-    return steer_prior, err, x_mean, road_m, grass_m, class_road, class_grass, conf
-
-
-def _make_actions(horizon, n, steer_center: float) -> torch.Tensor:
-    n_commit = max(32, n // 6)
+def _make_actions(horizon: int, n: int, steer_center: float) -> torch.Tensor:
+    n_commit = max(int(n * 0.15), 1)
     n_rand = n - n_commit
-
     offsets = torch.tensor([-0.55, -0.35, -0.20, -0.10, 0.0, 0.10, 0.20, 0.35, 0.55], device=DEVICE)
-    idx = torch.randint(0, offsets.numel(), (n_commit,), device=DEVICE)
-    s_commit = torch.clamp(torch.tensor(steer_center, device=DEVICE) + offsets[idx], -1.0, 1.0)
-    steer_commit = s_commit[:, None].repeat(1, horizon)
-
+    if n_commit < len(offsets):
+        idx = torch.randperm(len(offsets), device=DEVICE)[:n_commit]
+        s_commit_vals = torch.clamp(torch.tensor(steer_center, device=DEVICE) + offsets[idx], -1.0, 1.0)
+    else:
+        idx = torch.randint(0, offsets.numel(), (n_commit,), device=DEVICE)
+        s_commit_vals = torch.clamp(torch.tensor(steer_center, device=DEVICE) + offsets[idx], -1.0, 1.0)
+    
+    steer_commit = s_commit_vals[:, None].repeat(1, horizon)
     s0 = torch.randn(n_rand, device=DEVICE) * STEER_STD + float(steer_center)
     s0 = torch.clamp(s0, -1.0, 1.0)
     ds = torch.randn(n_rand, horizon, device=DEVICE) * STEER_DSTD
@@ -377,355 +170,207 @@ def _make_actions(horizon, n, steer_center: float) -> torch.Tensor:
 
     steer_all = torch.cat([steer_commit, steer], dim=0)
     abs_s = torch.abs(steer_all)
-
     gas = GAS_BASE - GAS_DROP * abs_s
     gas = torch.clamp(gas, MIN_GAS, 0.95)
+    brake = torch.zeros_like(gas)
+    return torch.stack([steer_all, gas, brake], dim=-1).to(torch.float32)
 
-    ramp = torch.clamp((abs_s - 0.55) / (1.0 - 0.55), 0.0, 1.0)
-    brake = torch.clamp(0.20 * ramp, 0.0, 0.22)
+def load_models():
+    if DEVICE.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+    for p in (MODEL_PATH_ENC, MODEL_PATH_PRED, MODEL_PATH_HEADS):
+        if not os.path.exists(p): raise FileNotFoundError(p)
 
-    return torch.stack([steer_all, gas, brake], dim=-1)
+    # --- ENCODER LOAD (ROBUST) ---
+    in_ch = 3 * FRAME_STACK
+    enc = TinyEncoder(in_ch=in_ch, emb_dim=512).to(DEVICE).eval()
+    enc_ckpt = torch.load(MODEL_PATH_ENC, map_location=DEVICE)
+    if isinstance(enc_ckpt, dict) and "encoder" in enc_ckpt:
+        enc_ckpt = enc_ckpt["encoder"]
+    enc.load_state_dict(_strip_prefixes(enc_ckpt), strict=False)
 
+    # --- PREDICTOR LOAD (ROBUST) ---
+    pred = Predictor().to(DEVICE).eval()
+    pred_ckpt = torch.load(MODEL_PATH_PRED, map_location=DEVICE)
+    if isinstance(pred_ckpt, dict) and "predictor" in pred_ckpt: 
+        pred_ckpt = pred_ckpt["predictor"]
+    pred.load_state_dict(_strip_prefixes(pred_ckpt), strict=False)
 
-def _image_cost_batch(decoded_bchw_01: torch.Tensor) -> torch.Tensor:
-    y1, y2, x1, x2 = ROI_COST
-    roi_t = decoded_bchw_01[:, :, y1:y2, x1:x2]
-    r = roi_t[:, 0]
-    g = roi_t[:, 1]
-    b = roi_t[:, 2]
-    m = (r + g + b) / 3.0
+    dec = None
+    if MODEL_PATH_DEC and os.path.exists(MODEL_PATH_DEC):
+        dec = TinyDecoder().to(DEVICE).eval()
+        dec.load_state_dict(torch.load(MODEL_PATH_DEC, map_location=DEVICE), strict=False)
 
-    green_index = g - 0.5 * (r + b)
-    grassness = _sigmoid((green_index - GRASS_BIAS) / GRASS_SCALE)
+    heads_ckpt = torch.load(MODEL_PATH_HEADS, map_location=DEVICE)
+    head_road = MLPHead(512, 1).to(DEVICE).eval()
+    head_spd  = MLPHead(512, 1).to(DEVICE).eval()
+    head_xoff = MLPHead(512, 1).to(DEVICE).eval()
+    head_road.load_state_dict(_strip_prefixes(heads_ckpt["head_road"]), strict=True)
+    head_spd.load_state_dict(_strip_prefixes(heads_ckpt["head_spd"]), strict=True)
+    head_xoff.load_state_dict(_strip_prefixes(heads_ckpt["head_xoff"]), strict=True)
+    return enc, pred, dec, head_road, head_spd, head_xoff
 
-    gate_lo = _sigmoid((m - MIN_M) / M_SOFT)
-    gate_hi = _sigmoid((MAX_M - m) / M_SOFT)
-    bright_gate = gate_lo * gate_hi
+def _ensure_video_writer(path: str, fps: int, fourcc: str, frame_wh: Tuple[int, int]) -> cv2.VideoWriter:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cc = cv2.VideoWriter_fourcc(*fourcc)
+    vw = cv2.VideoWriter(path, cc, float(fps), frame_wh)
+    return vw
 
-    road_w = (1.0 - grassness) * bright_gate
-    grass_w = grassness * bright_gate
+def _tensor01_to_bgr_u8(t: torch.Tensor, w: int, h: int) -> np.ndarray:
+    x = torch.clamp(t, 0, 1).detach().cpu()
+    if x.dim() == 4: x = x.squeeze(0)
+    x = x.permute(1, 2, 0).numpy()
+    x = (x * 255.0).astype(np.uint8)
+    x = cv2.resize(x, (w, h), interpolation=cv2.INTER_AREA)
+    x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+    return np.ascontiguousarray(x)
 
-    road_mean = road_w.mean(dim=(1, 2))
-    grass_mean = grass_w.mean(dim=(1, 2))
+@torch.no_grad()
+def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarray):
+    x_u8 = _stack_to_tensor_u8(stack_u8).to(DEVICE)
+    z0_bchw = encoder_latent(enc, x_u8)
+    feat0 = pool_feat(z0_bchw)
+    road0, spd0, xoff0 = heads_eval(head_road, head_spd, head_xoff, feat0)
 
-    B, _, h, w = roi_t.shape
-    xs = torch.linspace(0, 1, w, device=decoded_bchw_01.device)[None, None, :].repeat(B, h, 1)
-    denom = road_w.sum(dim=(1, 2)).clamp(min=1e-6)
-    x_mean = (road_w * xs).sum(dim=(1, 2)) / denom
-    center_offset = torch.abs(x_mean - 0.5)
+    # Prior Logic
+    steer_center = float(torch.clamp(-K_PRIOR * xoff0.squeeze(0), -0.75, 0.75).item())
+    actions = _make_actions(HORIZON, NUM_TENTACLES, steer_center) 
 
-    noroad = torch.relu(0.18 - road_mean)
-    return (IMG_W_CENTER * center_offset) + (IMG_W_GRASS * grass_mean) + (IMG_W_NOROAD * noroad)
-
-
-def mpc_policy(enc, pred, dec, frame):
-    img64 = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
-    t_img = torch.from_numpy(img64).float().to(DEVICE).div(255.0).permute(2, 0, 1).unsqueeze(0)
-
-    steer_prior, err, x_mean, road_m, grass_m, class_road, class_grass, conf = _compute_signals(t_img)
-
-    with torch.no_grad():
-        z_raw = enc(t_img)
-        z_mag = z_raw.norm(dim=1, keepdim=True).clamp(min=1e-6)
-        z0 = z_raw if PREDICTOR_SPACE == "raw" else _l2norm(z_raw)
-
-    actions = _make_actions(HORIZON, NUM_TENTACLES, steer_prior)
-
+    # Penalties
     steer = actions[:, :, 0]
-    gas = actions[:, :, 1]
-
-    mag_pen = STEER_MAG_PEN * torch.mean(torch.abs(steer), dim=1)
+    mag_pen  = STEER_MAG_PEN  * torch.mean(torch.abs(steer), dim=1)
     jerk_pen = STEER_JERK_PEN * torch.mean(torch.abs(steer[:, 1:] - steer[:, :-1]), dim=1)
     flip_pen = STEER_FLIP_PEN * torch.mean((steer[:, 1:] * steer[:, :-1] < 0).float(), dim=1)
-    sat_pen = STEER_SAT_PEN * torch.relu(torch.abs(actions[:, 0, 0]) - STEER_SAT_THRESH)
 
-    prior_pen = (PRIOR_W * conf) * torch.abs(actions[:, 0, 0] - float(steer_prior))
+    z = z0_bchw.repeat(NUM_TENTACLES, 1, 1, 1)
+    cost = torch.zeros(NUM_TENTACLES, device=DEVICE)
+    dreams: List[Tuple[int, torch.Tensor]] = []
+    decode_set = set(DECODE_STEPS)
 
-    gas_mean_pen = GAS_MEAN_PEN * torch.mean(gas, dim=1)
-    gas_turn_pen = GAS_TURN_PEN * torch.mean(gas * torch.abs(steer), dim=1)
-    steer_flip_mask = (steer[:, 1:] * steer[:, :-1] < 0).float()
-    gas_flip_pen = GAS_FLIP_PEN * torch.mean(steer_flip_mask * gas[:, 1:], dim=1)
+    for t in range(1, HORIZON + 1):
+        feat_t = pool_feat(z)
+        road_t, spd_t, xoff_t = heads_eval(head_road, head_spd, head_xoff, feat_t)
 
-    z = z0.repeat(NUM_TENTACLES, 1)
+        cost += (W_CENTER * torch.abs(xoff_t.squeeze(1)))
+        cost += (W_OFFROAD * torch.relu(ROAD_FLOOR - road_t.squeeze(1)))
+        
+        v_target = V_BASE - V_DROP * torch.abs(actions[:, t - 1, 0])
+        cost += (W_SPEED * (spd_t.squeeze(1) - v_target) ** 2)
 
-    with torch.no_grad():
-        img_cost_total = torch.zeros(NUM_TENTACLES, device=DEVICE)
-        for t in range(1, HORIZON + 1):
-            z = pred(z, actions[:, t - 1, :])
-            if PREDICTOR_SPACE == "norm":
-                z = _l2norm(z)
+        # STANDARD PREDICTION (No Output Flip, No Input Flip)
+        a_t = actions[:, t - 1, :]
+        z = _pred_step(pred, z, a_t, spd_t.squeeze(1))
+        if PREDICTOR_SPACE == "norm": z = _l2norm_bchw(z)
 
-            if t in DECODE_STEPS:
-                if PREDICTOR_SPACE == "raw":
-                    z_dec = z
-                else:
-                    z_dec = _l2norm(z) * z_mag
-                imgs = torch.clamp(dec(z_dec), 0, 1)
-                img_cost_total += _image_cost_batch(imgs)
+        if dec is not None and t in decode_set:
+            dreams.append((t, z))
 
-        score = (
-            -img_cost_total
-            - mag_pen - jerk_pen - flip_pen - sat_pen
-            - prior_pen
-            - gas_mean_pen - gas_turn_pen - gas_flip_pen
-        )
+    score = -(cost + mag_pen + jerk_pen + flip_pen)
+    best = torch.argmax(score).item()
+    a0 = actions[best, 0].detach().cpu().numpy()
 
-        best = torch.argmax(score).item()
-        best_action0 = actions[best, 0].detach().cpu().numpy()
+    recon = None
+    if dec is not None:
+        try: recon = torch.clamp(dec(z0_bchw), 0, 1)
+        except: pass
 
-        recon = dec(z_raw)
+    dream_imgs = []
+    if dec is not None and dreams:
+        for (t, z_batch) in dreams:
+            try:
+                z_best = z_batch[best:best+1] 
+                dream = torch.clamp(dec(z_best), 0, 1)
+                dream_imgs.append((t, dream))
+            except: pass
 
-        z_vis = z0.clone()
-        for _ in range(VIS_HORIZON):
-            z_vis = pred(z_vis, actions[best, 0, :].unsqueeze(0))
-            if PREDICTOR_SPACE == "norm":
-                z_vis = _l2norm(z_vis)
-
-        if PREDICTOR_SPACE == "raw":
-            z_dec = z_vis
-        else:
-            z_dec = _l2norm(z_vis) * z_mag
-        dream = dec(z_dec)
-
-    dbg = dict(
-        steer_prior=float(steer_prior),
-        err=float(err),
-        x_mean=float(x_mean),
-        road_m=float(road_m),
-        grass_m=float(grass_m),
-        class_road=float(class_road),
-        class_grass=float(class_grass),
-        conf=float(conf),
-    )
-    return best_action0, float(score[best].item()), recon, dream, img64, dbg
-
-
-def apply_real_speed_governor(env, action: np.ndarray, flip_left: int):
-    steer = float(action[0])
-    gas = float(action[1])
-    brake = float(action[2])
-
-    v = get_speed(env)
-
-    v_target = V_BASE - V_DROP * abs(steer)
-    if flip_left > 0:
-        v_target -= V_FLIP_DROP
-    v_target = float(np.clip(v_target, V_MIN, V_BASE))
-
-    overspeed = (v > (v_target + OVERSPEED_DEADBAND))
-    if overspeed:
-        over_amt = v - (v_target + OVERSPEED_DEADBAND)
-        brake = max(brake, float(np.clip(SPEED_BRAKE_K * over_amt, 0.0, 0.55)))
-        gas = min(gas, OVERSPEED_GAS_CAP)
-    else:
-        gas = min(gas, SPEED_GAS_CAP)
-
-    return np.array([steer, gas, brake], dtype=np.float32), v, v_target, overspeed
-
+    dbg = {
+        "steer_center": steer_center,
+        "road0": float(road0.item()),
+        "spd0": float(spd0.item()),
+        "xoff0": float(xoff0.item()),
+        "score_best": float(score[best].item()),
+        "cost_best": float(cost[best].item()),
+    }
+    return a0, dbg, recon, dream_imgs
 
 def main():
     env = gym.make("CarRacing-v3", render_mode="human")
-    enc, pred, dec = load_models()
-    rec = VideoRecorder()
+    enc, pred, dec, head_road, head_spd, head_xoff = load_models()
+    vw: Optional[cv2.VideoWriter] = None
+    out_path = os.path.join(VIDEO_DIR, VIDEO_OUT)
 
     env.reset()
     env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
 
-    step_i = 0
-    last_steer = 0.0
-
-    # Recovery
-    rec_mode = False
-    rec_phase = 0
-    rec_t = 0
-    rec_turn_sign = 1.0
-    best_class_seen = 0.0
-    class_prev = 0.0
-    exit_good = 0
-
-    # Flip-brake
-    flip_brake_left = 0
-
-    # Post-recovery
-    post_rec_left = 0
-
-    # warmup + kickstart
-    for _ in range(40):
+    buf = deque(maxlen=FRAME_STACK)
+    for _ in range(FRAME_STACK):
+        fr = capture_window(env)
+        if fr is not None: buf.append(_rgb64_u8(fr))
         env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
-        capture_window(env)
-    for _ in range(20):
-        env.step(np.array([0.0, 0.7, 0.0], dtype=np.float32))
-        capture_window(env)
+    
+    for _ in range(10): 
+        env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
+        fr = capture_window(env)
+        if fr is not None: buf.append(_rgb64_u8(fr))
+
+    step_i = 0
+    last_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16) if DEVICE.type == "cuda" else torch.no_grad()
 
     try:
         while True:
             frame = capture_window(env)
             if frame is None:
+                env.step(last_action)
                 continue
+            buf.append(_rgb64_u8(frame))
+            if len(buf) < FRAME_STACK:
+                env.step(last_action)
+                continue
+            
+            stack = np.stack(list(buf), axis=0)
+            with amp_ctx:
+                a0, dbg, recon, dreams = mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack)
 
-            a0, sc, recon, dream, tiny, dbg = mpc_policy(enc, pred, dec, frame)
-            v_now = get_speed(env)
-
-            # Enter recovery
-            if (not rec_mode) and (dbg["class_road"] < OFF_ROAD_CLASS):
-                rec_mode = True
-                rec_phase = 0
-                rec_t = 0
-                best_class_seen = dbg["class_road"]
-                class_prev = dbg["class_road"]
-                exit_good = 0
-
-                if abs(last_steer) > 0.10:
-                    rec_turn_sign = 1.0 if last_steer > 0 else -1.0
-                elif abs(dbg["steer_prior"]) > 0.05:
-                    rec_turn_sign = 1.0 if dbg["steer_prior"] > 0 else -1.0
-                else:
-                    rec_turn_sign = 1.0
-
-            # Sticky exit
-            if rec_mode:
-                if dbg["class_road"] > REC_EXIT_CLASS:
-                    exit_good += 1
-                else:
-                    exit_good = 0
-                if exit_good >= REC_EXIT_COUNT:
-                    rec_mode = False
-                    rec_phase = 0
-                    rec_t = 0
-                    exit_good = 0
-                    post_rec_left = POST_REC_STEPS
-
-            if rec_mode:
-                rec_t += 1
-                mode_str = "REC"
-                if rec_phase == 0:
-                    action = np.array([0.0, 0.0, 0.60], dtype=np.float32)
-                    if rec_t >= REC_STABILIZE_STEPS:
-                        rec_phase = 1
-                        rec_t = 0
-
-                elif rec_phase == 1:
-                    improving = (dbg["class_road"] - class_prev)
-                    boost = REC_SEARCH_BOOST if improving > 0.004 else 0.0
-                    class_prev = dbg["class_road"]
-
-                    steer = rec_turn_sign * REC_SEARCH_STEER
-                    gas = float(np.clip(REC_SEARCH_GAS + boost, 0.0, 0.88))
-                    brake = REC_SEARCH_BRAKE
-                    action = np.array([steer, gas, brake], dtype=np.float32)
-
-                    if dbg["class_road"] > best_class_seen + 0.01:
-                        best_class_seen = dbg["class_road"]
-                    if rec_t % 28 == 0 and dbg["class_road"] < best_class_seen + 0.005:
-                        rec_turn_sign *= -1.0
-
-                    if rec_t >= REC_SEARCH_STEPS:
-                        rec_phase = 2
-                        rec_t = 0
-
-                else:
-                    steer = float(np.clip(REC_REJOIN_K * dbg["err"], -REC_REJOIN_STEER_CLAMP, REC_REJOIN_STEER_CLAMP))
-                    action = np.array([steer, REC_REJOIN_GAS, REC_REJOIN_BRAKE], dtype=np.float32)
-                    if rec_t >= REC_REJOIN_STEPS:
-                        rec_phase = 1
-                        rec_t = 0
-
-                v = get_speed(env)
-                v_tgt = 0.0
-                over = 0
-                flip = 0
-
-            else:
-                mode_str = "MPC"
-                steer_cmd = MOMENTUM * last_steer + (1.0 - MOMENTUM) * float(a0[0])
-                steer_cmd = float(np.clip(steer_cmd, -1.0, 1.0))
-                action = np.array([steer_cmd, float(a0[1]), float(a0[2])], dtype=np.float32)
-
-                if v_now > FLIP_MIN_SPEED:
-                    turning = (abs(last_steer) > FLIP_TURN_GATE) or (abs(action[0]) > FLIP_TURN_GATE)
-                    big_flip = (np.sign(last_steer) != np.sign(action[0])) and (abs(action[0] - last_steer) > FLIP_STEER_DELTA)
-                    if turning and big_flip:
-                        flip_brake_left = FLIP_BRAKE_STEPS
-
-                flip = 1 if flip_brake_left > 0 else 0
-                if flip_brake_left > 0:
-                    action[2] = max(action[2], FLIP_BRAKE)
-                    action[1] = min(action[1], FLIP_GAS_CAP)
-                    flip_brake_left -= 1
-
-                action, v, v_tgt, overspeed = apply_real_speed_governor(env, action, flip_brake_left)
-                over = 1 if overspeed else 0
-
-                if post_rec_left > 0:
-                    action[0] = float(np.clip(action[0], -POST_REC_STEER_CLAMP, POST_REC_STEER_CLAMP))
-                    action[1] = min(action[1], POST_REC_GAS)
-                    action[2] = min(action[2], 0.12)
-                    post_rec_left -= 1
-
-            last_steer = float(action[0])
-
-            _, _, done, trunc, _ = env.step(action)
+            # Standard Action
+            last_action = a0.astype(np.float32)
+            
+            _, _, terminated, truncated, _ = env.step(last_action)
             step_i += 1
 
-            if DEBUG_PRINT and step_i % 10 == 0:
-                print(
-                    f"step={step_i:05d} mode={mode_str} v={v:5.2f} vt={v_tgt:5.2f} over={over} flip={flip} "
-                    f"steer={action[0]:+.3f} gas={action[1]:.3f} brake={action[2]:.3f} score={sc:+.3f} | "
-                    f"prior={dbg['steer_prior']:+.3f} conf={dbg['conf']:.2f} err={dbg['err']:+.3f} class_road={dbg['class_road']:.3f}"
-                )
+            if DEBUG_PRINT and (step_i % 20 == 0):
+                print(f"step={step_i:05d} steer={last_action[0]:+.3f} | xoff={dbg['xoff0']:+.3f}")
 
-            # -----------------------------
-            # HUD (ALL PANELS -> uint8 BGR BEFORE STACKING)
-            # -----------------------------
             vis_real = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            vis_real = cv2.resize(vis_real, (400, 300))
-            cv2.putText(vis_real, "LIVE GAME", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-            vis_input = cv2.cvtColor(tiny, cv2.COLOR_RGB2BGR)
-            vis_input = cv2.resize(vis_input, (100, 100), interpolation=cv2.INTER_NEAREST)
-            vis_real[200:300, 300:400] = vis_input
-
-            # Recon/Dream: float(0..1) -> uint8(0..255) BEFORE stack
-            r = _tensor01_to_bgr_u8(recon, 400, 300)
-            cv2.putText(r, "What Net Sees", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-            d = _tensor01_to_bgr_u8(dream, 400, 300)
-            cv2.putText(d, "Prediction", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-            vis = np.hstack((vis_real, r, d))  # stays uint8 now
-            cv2.putText(vis, f"mode={mode_str} score={sc:.3f}", (10, 290),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            vis = np.ascontiguousarray(vis, dtype=np.uint8)
-
-            rec.write(vis)
-            cv2.imshow("World Model Pilot (fast governor + flags)", vis)
-
-            if cv2.waitKey(1) == 27 or done or trunc:
-                env.reset()
-                last_steer = 0.0
-                rec_mode = False
-                rec_phase = 0
-                rec_t = 0
-                rec_turn_sign = 1.0
-                best_class_seen = 0.0
-                class_prev = 0.0
-                exit_good = 0
-                flip_brake_left = 0
-                post_rec_left = 0
-
-                for _ in range(40):
+            vis_real = cv2.resize(vis_real, (400, 300), interpolation=cv2.INTER_AREA)
+            panels = [vis_real]
+            if recon is not None:
+                r = _tensor01_to_bgr_u8(recon, 400, 300)
+                panels.append(r)
+            if dreams:
+                t, dream = dreams[0]
+                d = _tensor01_to_bgr_u8(dream, 400, 300)
+                cv2.putText(d, f"PRED t+{t}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 255), 2)
+                panels.append(d)
+            
+            vis = np.hstack(panels)
+            cv2.imshow("Fast MPC (Standard Physics)", vis)
+            if RECORD:
+                if vw is None: vw = _ensure_video_writer(out_path, VIDEO_FPS, VIDEO_FOURCC, (vis.shape[1], vis.shape[0]))
+                vw.write(vis)
+            if (cv2.waitKey(1) == 27) or terminated or truncated:
+                if terminated or truncated: env.reset()
+                buf.clear()
+                for _ in range(FRAME_STACK):
+                    fr = capture_window(env)
+                    if fr is not None: buf.append(_rgb64_u8(fr))
                     env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
-                    capture_window(env)
-                for _ in range(20):
-                    env.step(np.array([0.0, 0.7, 0.0], dtype=np.float32))
-                    capture_window(env)
-
+                last_action[:] = 0.0
     finally:
-        rec.close()
-        env.close()
+        try: env.close()
+        except: pass
         cv2.destroyAllWindows()
-
+        if vw is not None: vw.release()
 
 if __name__ == "__main__":
     main()
