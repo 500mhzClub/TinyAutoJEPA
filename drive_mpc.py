@@ -15,10 +15,32 @@ from typing import Dict, Tuple, Optional, List
 """
 drive_mpc.py — “Pure latent MPC” for CarRacing-v3
 
-FINAL CONFIG:
-- Standard Physics (No Inversions)
-- Robust Model Loading
-- Active Prior for Lane Keeping
+FINAL CONFIGURATION:
+- Barrier Function Cost (W_WALL) for virtual guardrails.
+- High Density Sampling (256 tentacles).
+- Visualization of the virtual wall boundaries.
+
+# W_WALL=5000.0: Massive penalty for touching the grass logic.
+# W_SPEED=0.5: Reward for speed, but Walls take priority.
+# NUM_TENTACLES=256: Need density to find the "safe" path in the barrier.
+PREDICTOR_SPACE=raw \
+HORIZON=10 \
+NUM_TENTACLES=256 \
+K_PRIOR=0.0 \
+W_CENTER=5.0 \
+W_WALL=5000.0 \
+W_OFFROAD=0.0 \
+W_SPEED=0.5 \
+V_BASE=0.0 \
+STEER_SMOOTH=0.1 \
+STEER_MAG_PEN=0.0 \
+INVERT_OUTPUT=0 \
+MODEL_PATH_ENC=./models/encoder_mixed_final.pth \
+MODEL_PATH_PRED=./models/predictor_final.pth \
+MODEL_PATH_HEADS=./models/latent_heads.pth \
+MODEL_PATH_DEC=./models/decoder_final.pth \
+python drive_mpc.py
+
 """
 
 # -----------------------------
@@ -36,12 +58,12 @@ PREDICTOR_SPACE = os.getenv("PREDICTOR_SPACE", "raw").lower()
 # -----------------------------
 # MPC parameters
 # -----------------------------
-HORIZON = int(os.getenv("HORIZON", "14"))
-NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "128"))
+HORIZON = int(os.getenv("HORIZON", "10"))
+NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "256"))
 
 STEER_STD    = float(os.getenv("STEER_STD", "0.5"))
 STEER_DSTD   = float(os.getenv("STEER_DSTD", "0.20"))
-STEER_SMOOTH = float(os.getenv("STEER_SMOOTH", "0.1"))
+STEER_SMOOTH = float(os.getenv("STEER_SMOOTH", "0.15"))
 
 GAS_BASE = float(os.getenv("GAS_BASE", "0.78"))
 GAS_DROP = float(os.getenv("GAS_DROP", "0.45"))
@@ -51,18 +73,21 @@ STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.0"))
 STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.0"))
 STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.0"))
 
-W_CENTER  = float(os.getenv("W_CENTER", "10.0"))
+W_CENTER  = float(os.getenv("W_CENTER", "5.0"))
 W_OFFROAD = float(os.getenv("W_OFFROAD", "0.0")) 
 ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.20"))
-W_SPEED = float(os.getenv("W_SPEED", "1.0"))
+W_SPEED = float(os.getenv("W_SPEED", "0.5"))
 
-V_BASE  = float(os.getenv("V_BASE", "12.0"))
-V_DROP  = float(os.getenv("V_DROP", "10.0"))
-V_MIN   = float(os.getenv("V_MIN", "9.0"))
+# BARRIER: If |x_offset| > 0.30, cost explodes
+W_WALL = float(os.getenv("W_WALL", "5000.0")) 
+
+V_BASE  = float(os.getenv("V_BASE", "0.0")) # Let optimizer decide speed mostly
+V_DROP  = float(os.getenv("V_DROP", "0.0"))
+V_MIN   = float(os.getenv("V_MIN", "0.0"))
 
 K_PRIOR = float(os.getenv("K_PRIOR", "0.0"))
 
-DECODE_STEPS = os.getenv("DECODE_STEPS", "2,6,10")
+DECODE_STEPS = os.getenv("DECODE_STEPS", "2,5,8")
 DECODE_STEPS = [int(x) for x in DECODE_STEPS.split(",") if x.strip()]
 DECODE_STEPS = [s for s in DECODE_STEPS if 1 <= s <= HORIZON]
 
@@ -185,6 +210,7 @@ def load_models():
     in_ch = 3 * FRAME_STACK
     enc = TinyEncoder(in_ch=in_ch, emb_dim=512).to(DEVICE).eval()
     enc_ckpt = torch.load(MODEL_PATH_ENC, map_location=DEVICE)
+    # Handle nested dict if present, else use direct state_dict
     if isinstance(enc_ckpt, dict) and "encoder" in enc_ckpt:
         enc_ckpt = enc_ckpt["encoder"]
     enc.load_state_dict(_strip_prefixes(enc_ckpt), strict=False)
@@ -251,13 +277,28 @@ def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarra
         feat_t = pool_feat(z)
         road_t, spd_t, xoff_t = heads_eval(head_road, head_spd, head_xoff, feat_t)
 
-        cost += (W_CENTER * torch.abs(xoff_t.squeeze(1)))
+        # --- BARRIER COST FUNCTION ---
+        # Instead of linear cost, we use a "Soft Wall"
+        # x_offset is [-0.5, 0.5]. The road edge is approx +/- 0.35.
+        dist = torch.abs(xoff_t.squeeze(1))
+        
+        # 1. Base Centering (Keep it tidy)
+        cost += (W_CENTER * dist) 
+        
+        # 2. The Wall (Exponential Penalty near edge)
+        # If dist > 0.3, cost explodes.
+        # 0.25 -> 0 cost, 0.35 -> 100 cost, 0.45 -> 10000 cost
+        in_danger = torch.relu(dist - 0.25) 
+        cost += (W_WALL * (in_danger ** 2))
+        # -----------------------------
+
         cost += (W_OFFROAD * torch.relu(ROAD_FLOOR - road_t.squeeze(1)))
         
-        v_target = V_BASE - V_DROP * torch.abs(actions[:, t - 1, 0])
-        cost += (W_SPEED * (spd_t.squeeze(1) - v_target) ** 2)
+        # Speed Reward (Negative cost = Reward)
+        # We want to be FAST, but not if it hits the wall.
+        cost -= (W_SPEED * spd_t.squeeze(1))
 
-        # STANDARD PREDICTION (No Output Flip, No Input Flip)
+        # Standard Prediction (Trusting standard physics)
         a_t = actions[:, t - 1, :]
         z = _pred_step(pred, z, a_t, spd_t.squeeze(1))
         if PREDICTOR_SPACE == "norm": z = _l2norm_bchw(z)
@@ -341,8 +382,24 @@ def main():
             if DEBUG_PRINT and (step_i % 20 == 0):
                 print(f"step={step_i:05d} steer={last_action[0]:+.3f} | xoff={dbg['xoff0']:+.3f}")
 
+            # --- HUD VISUALIZATION ---
             vis_real = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             vis_real = cv2.resize(vis_real, (400, 300), interpolation=cv2.INTER_AREA)
+            
+            # Draw Barrier Bars
+            # Center of image is 200. Full width is -0.5 to 0.5
+            # Scale: 1.0 unit = 400 pixels width? No, that's too wide.
+            # Let's say -0.5=0px, 0.0=200px, +0.5=400px.
+            
+            x_curr = int(200 + (dbg['xoff0'] * 400))
+            cv2.line(vis_real, (x_curr, 280), (x_curr, 300), (0, 255, 0), 4) # Car Pos
+            
+            # Draw Walls at +/- 0.3
+            w_left = int(200 - (0.3 * 400))
+            w_rght = int(200 + (0.3 * 400))
+            cv2.line(vis_real, (w_left, 280), (w_left, 300), (0, 0, 255), 2)
+            cv2.line(vis_real, (w_rght, 280), (w_rght, 300), (0, 0, 255), 2)
+            
             panels = [vis_real]
             if recon is not None:
                 r = _tensor01_to_bgr_u8(recon, 400, 300)
@@ -354,7 +411,9 @@ def main():
                 panels.append(d)
             
             vis = np.hstack(panels)
-            cv2.imshow("Fast MPC (Standard Physics)", vis)
+            cv2.putText(vis, f"XOFF: {dbg['xoff0']:+.2f}", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            cv2.imshow("Fast MPC (Barrier Function)", vis)
             if RECORD:
                 if vw is None: vw = _ensure_video_writer(out_path, VIDEO_FPS, VIDEO_FOURCC, (vis.shape[1], vis.shape[0]))
                 vw.write(vis)
