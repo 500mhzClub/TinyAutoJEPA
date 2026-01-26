@@ -13,15 +13,13 @@ from collections import deque
 from typing import Dict, Tuple, Optional, List
 
 """
-drive_mpc.py — Vision-Grounded Latent MPC
+drive_mpc.py — Calibrated & Grounded Latent MPC
 
 UPDATES:
-- W_OFFROAD is now 5.0 (Grass is bad).
-- W_WALL reduced to 100.0 (Strong barrier, but allows gradient flow).
-- ROAD_FLOOR set to 0.4 (If road probability < 40%, start panicking).
-- PREDICTOR_SPACE matches training config.
+- Added X_GAIN and X_BIAS to correct left-hugging tendency.
+- Increased ROAD_FLOOR to 0.80 to stop "curb surfing".
+- Visualization now draws the "Target Center" to help you debug alignment.
 
-# The cost weights here match the logic in the new script
 PREDICTOR_SPACE=raw \
 MODEL_PATH_ENC=./models/encoder_mixed_final.pth \
 MODEL_PATH_PRED=./models/predictor_final.pth \
@@ -32,9 +30,11 @@ NUM_TENTACLES=512 \
 W_WALL=500.0 \
 W_OFFROAD=5.0 \
 W_CENTER=10.0 \
-ROAD_FLOOR=0.70 \
 W_SPEED=0.8 \
+ROAD_FLOOR=0.80 \
 K_PRIOR=0.5 \
+X_GAIN=2.0 \
+X_BIAS=-0.05 \
 python drive_mpc.py
 """
 
@@ -51,10 +51,10 @@ FRAME_STACK = int(os.getenv("FRAME_STACK", "4"))
 PREDICTOR_SPACE = os.getenv("PREDICTOR_SPACE", "raw").lower()
 
 # -----------------------------
-# MPC parameters (FIXED)
+# MPC parameters
 # -----------------------------
 HORIZON = int(os.getenv("HORIZON", "15"))
-NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "512")) # More samples for better search
+NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "512"))
 
 STEER_STD    = float(os.getenv("STEER_STD", "0.5"))
 STEER_DSTD   = float(os.getenv("STEER_DSTD", "0.20"))
@@ -64,20 +64,23 @@ GAS_BASE = float(os.getenv("GAS_BASE", "0.78"))
 GAS_DROP = float(os.getenv("GAS_DROP", "0.45"))
 MIN_GAS  = float(os.getenv("MIN_GAS", "0.22"))
 
-STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.01")) # Tiny penalty to prefer straight if costs equal
+STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.01"))
 STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.01"))
-STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.0"))
 
-W_CENTER  = float(os.getenv("W_CENTER", "2.0"))   # Gentle centering
-W_OFFROAD = float(os.getenv("W_OFFROAD", "5.0"))  # CRITICAL: Grass cost > 0
-ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.40")) # Tolerates minor edge noise
-W_SPEED = float(os.getenv("W_SPEED", "0.8"))      # Reward speed
+W_CENTER  = float(os.getenv("W_CENTER", "10.0"))  # Strong centering
+W_OFFROAD = float(os.getenv("W_OFFROAD", "5.0"))
+ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.80")) # 80% confidence required
+W_SPEED = float(os.getenv("W_SPEED", "0.8"))
+W_WALL = float(os.getenv("W_WALL", "500.0")) 
 
-# BARRIER: If |x_offset| > 0.30, cost explodes
-# Was 5000.0 (Too stiff), now 100.0 (Strong but manageable)
-W_WALL = float(os.getenv("W_WALL", "100.0")) 
+K_PRIOR = float(os.getenv("K_PRIOR", "0.5"))
 
-K_PRIOR = float(os.getenv("K_PRIOR", "0.2")) # Use current xoff to bias sampling slightly
+# --- CALIBRATION ---
+# X_GAIN: Amplifies the offset. If model says -0.1 but reality is -0.3, Gain=3.0 fixes it.
+# X_BIAS: Shifts the target. If car hugs left, add NEGATIVE bias to force it RIGHT.
+#         (Based on observation: Left = Negative Xoff. To make 0 target appear "Right", we subtract).
+X_GAIN = float(os.getenv("X_GAIN", "2.0")) 
+X_BIAS = float(os.getenv("X_BIAS", "-0.05"))
 
 DECODE_STEPS = os.getenv("DECODE_STEPS", "2,5,8")
 DECODE_STEPS = [int(x) for x in DECODE_STEPS.split(",") if x.strip()]
@@ -147,15 +150,17 @@ class MLPHead(nn.Module):
 
 @torch.no_grad()
 def heads_eval(head_road, head_spd, head_xoff, feat512):
-    # Road: Trained with BCEWithLogits -> Use Sigmoid to get probability
     road = torch.sigmoid(head_road(feat512))
-    
-    # Speed: Raw MSE -> Identity
     spd  = head_spd(feat512)
+    # Raw output + Tanh scaling from training
+    xoff_raw = torch.tanh(head_xoff(feat512)) * 0.5
     
-    # XOff: Trained with Tanh*0.5 in mind (see train_latent_heads.py)
-    xoff = torch.tanh(head_xoff(feat512)) * 0.5
-    return road, spd, xoff
+    # --- CALIBRATION INJECTION ---
+    # 1. Gain: Amplify signal (If model underestimates offset)
+    # 2. Bias: Shift equilibrium (If model consistently hugs Left)
+    xoff_calib = (xoff_raw * X_GAIN) + X_BIAS
+    
+    return road, spd, xoff_calib
 
 @torch.no_grad()
 def encoder_latent(enc: nn.Module, x_u8: torch.Tensor) -> torch.Tensor:
@@ -175,17 +180,14 @@ def _make_actions(horizon: int, n: int, steer_center: float) -> torch.Tensor:
     # Biased sampling around the 'steer_center' (heuristic from xoff)
     offsets = torch.tensor([-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5], device=DEVICE)
     
-    # Commit strategies (constant actions)
     if n_commit < len(offsets):
         idx = torch.randperm(len(offsets), device=DEVICE)[:n_commit]
         s_vals = torch.clamp(steer_center + offsets[idx], -1.0, 1.0)
     else:
-        # Just random fill if we have huge N
         s_vals = (torch.rand(n_commit, device=DEVICE) * 2 - 1)
     
     steer_commit = s_vals[:, None].repeat(1, horizon)
     
-    # Browninan motion / Random Walk
     s0 = torch.randn(n_rand, device=DEVICE) * STEER_STD + steer_center
     s0 = torch.clamp(s0, -1.0, 1.0)
     ds = torch.randn(n_rand, horizon, device=DEVICE) * STEER_DSTD
@@ -198,7 +200,6 @@ def _make_actions(horizon: int, n: int, steer_center: float) -> torch.Tensor:
 
     steer_all = torch.cat([steer_commit, steer], dim=0)
     
-    # Gas logic: slow down when turning hard
     abs_s = torch.abs(steer_all)
     gas = GAS_BASE - GAS_DROP * abs_s
     gas = torch.clamp(gas, MIN_GAS, 1.0)
@@ -212,26 +213,22 @@ def load_models():
     for p in (MODEL_PATH_ENC, MODEL_PATH_PRED, MODEL_PATH_HEADS):
         if not os.path.exists(p): raise FileNotFoundError(p)
 
-    # --- ENCODER ---
     in_ch = 3 * FRAME_STACK
     enc = TinyEncoder(in_ch=in_ch, emb_dim=512).to(DEVICE).eval()
     enc_ckpt = torch.load(MODEL_PATH_ENC, map_location=DEVICE)
     if isinstance(enc_ckpt, dict) and "encoder" in enc_ckpt: enc_ckpt = enc_ckpt["encoder"]
     enc.load_state_dict(_strip_prefixes(enc_ckpt), strict=False)
 
-    # --- PREDICTOR ---
     pred = Predictor().to(DEVICE).eval()
     pred_ckpt = torch.load(MODEL_PATH_PRED, map_location=DEVICE)
     if isinstance(pred_ckpt, dict) and "predictor" in pred_ckpt: pred_ckpt = pred_ckpt["predictor"]
     pred.load_state_dict(_strip_prefixes(pred_ckpt), strict=False)
 
-    # --- DECODER (Optional) ---
     dec = None
     if MODEL_PATH_DEC and os.path.exists(MODEL_PATH_DEC):
         dec = TinyDecoder().to(DEVICE).eval()
         dec.load_state_dict(torch.load(MODEL_PATH_DEC, map_location=DEVICE), strict=False)
 
-    # --- HEADS ---
     heads_ckpt = torch.load(MODEL_PATH_HEADS, map_location=DEVICE)
     head_road = MLPHead(512, 1).to(DEVICE).eval()
     head_spd  = MLPHead(512, 1).to(DEVICE).eval()
@@ -263,62 +260,48 @@ def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarra
     z0_bchw = encoder_latent(enc, x_u8)
     feat0 = pool_feat(z0_bchw)
     
-    # Assess current state
     road0, spd0, xoff0 = heads_eval(head_road, head_spd, head_xoff, feat0)
     xoff_val = xoff0.item()
 
-    # Prior: If we are to the right (xoff > 0), we want to steer LEFT (negative) to correct.
-    # K_PRIOR steers us back to 0.
+    # Prior: K_PRIOR steers us back to 0.
     steer_bias = -K_PRIOR * xoff_val 
     steer_bias = float(np.clip(steer_bias, -0.5, 0.5))
 
     actions = _make_actions(HORIZON, NUM_TENTACLES, steer_bias) 
 
-    # Action smoothness penalties
     steer = actions[:, :, 0]
     mag_pen  = STEER_MAG_PEN  * torch.mean(torch.abs(steer), dim=1)
     jerk_pen = STEER_JERK_PEN * torch.mean(torch.abs(steer[:, 1:] - steer[:, :-1]), dim=1)
     
-    # Dynamics rollout
     z = z0_bchw.repeat(NUM_TENTACLES, 1, 1, 1)
     cost = torch.zeros(NUM_TENTACLES, device=DEVICE)
     dreams: List[Tuple[int, torch.Tensor]] = []
     decode_set = set(DECODE_STEPS)
 
     for t in range(1, HORIZON + 1):
-        # 1. Decode Latent Semantics
         feat_t = pool_feat(z)
         road_t, spd_t, xoff_t = heads_eval(head_road, head_spd, head_xoff, feat_t)
         
-        # 2. Cost Calculation
-        
-        # A. Centerline Cost
-        # Distance from 0.0
+        # Center Cost: Penalize deviation from 0.0
+        # (Since we applied Bias in heads_eval, 0.0 is now the 'Corrected Center')
         dist = torch.abs(xoff_t.squeeze(1))
         cost += (W_CENTER * dist) 
         
-        # B. Soft Wall (Barrier)
-        # If dist > 0.35 (Edge of track roughly), penalty spikes.
-        # This keeps car within [-0.35, 0.35]
+        # Wall Cost
         in_danger = torch.relu(dist - 0.30) 
         cost += (W_WALL * (in_danger ** 2))
 
-        # C. Offroad Cost
-        # If road_t < 0.4, we are likely on grass.
-        # Use ReLU so we only penalize low roadness.
+        # Offroad Cost
         is_grass = torch.relu(ROAD_FLOOR - road_t.squeeze(1))
         cost += (W_OFFROAD * is_grass)
         
-        # D. Speed Reward
-        # Negative cost.
+        # Speed Reward
         cost -= (W_SPEED * spd_t.squeeze(1))
 
-        # 3. Next State
         a_t = actions[:, t - 1, :]
         z = _pred_step(pred, z, a_t, spd_t.squeeze(1))
         if PREDICTOR_SPACE == "norm": z = _l2norm_bchw(z)
 
-        # 4. Save visualization frame
         if dec is not None and t in decode_set:
             dreams.append((t, z))
 
@@ -326,13 +309,11 @@ def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarra
     best = torch.argmax(score).item()
     a0 = actions[best, 0].detach().cpu().numpy()
 
-    # Reconstruction for debug
     recon = None
     if dec is not None:
         try: recon = torch.clamp(dec(z0_bchw), 0, 1)
         except: pass
 
-    # Extract dreams for best path
     dream_imgs = []
     if dec is not None and dreams:
         for (t, z_batch) in dreams:
@@ -357,17 +338,14 @@ def main():
     out_path = os.path.join(VIDEO_DIR, VIDEO_OUT)
 
     env.reset()
-    # Initial kick to start car
     env.step(np.array([0.0, 1.0, 0.0], dtype=np.float32))
 
     buf = deque(maxlen=FRAME_STACK)
-    # Fill buffer
     for _ in range(FRAME_STACK):
         fr = capture_window(env)
         if fr is not None: buf.append(_rgb64_u8(fr))
         env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
     
-    # Warmup
     for _ in range(20): 
         env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
         fr = capture_window(env)
@@ -398,21 +376,24 @@ def main():
             step_i += 1
 
             if DEBUG_PRINT and (step_i % 10 == 0):
-                print(f"step={step_i:05d} | steer={last_action[0]:+.2f} gas={last_action[1]:.2f} | xoff={dbg['xoff0']:+.2f} road={dbg['road0']:.2f}")
+                print(f"step={step_i:05d} | steer={last_action[0]:+.2f} xoff={dbg['xoff0']:+.2f} road={dbg['road0']:.2f}")
 
             # --- HUD ---
             vis_real = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             vis_real = cv2.resize(vis_real, (400, 300), interpolation=cv2.INTER_AREA)
             
-            # Gauge: X Offset
-            # Center (200) is 0.0. Range +/- 0.5 maps to +/- 200px (Full width)
+            # Gauge: X Offset with Calibration Markers
             cx = int(200 + (dbg['xoff0'] * 400))
-            cv2.line(vis_real, (200, 260), (200, 290), (255, 255, 255), 1) # Center Ref
+            # Draw Center
+            cv2.line(vis_real, (200, 260), (200, 290), (100, 100, 100), 1) 
+            # Draw Target Equilibrium (which is 0.0 post-bias, so visually centered)
             cv2.circle(vis_real, (cx, 275), 6, (0, 0, 255) if abs(dbg['xoff0'])>0.3 else (0, 255, 0), -1)
+            cv2.putText(vis_real, f"X:{dbg['xoff0']:.2f}", (cx+10, 275), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
             
-            # Gauge: Road Confidence
+            # Road Confidence
             rw = int(dbg['road0'] * 100)
-            cv2.rectangle(vis_real, (10, 10), (10+rw, 25), (0, 255, 255), -1)
+            col = (0, 255, 0) if dbg['road0'] > ROAD_FLOOR else (0, 0, 255)
+            cv2.rectangle(vis_real, (10, 10), (10+rw, 25), col, -1)
             cv2.putText(vis_real, f"ROAD", (120, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             panels = [vis_real]
@@ -420,10 +401,9 @@ def main():
                 r = _tensor01_to_bgr_u8(recon, 400, 300)
                 panels.append(r)
             if dreams:
-                # Show furthest dream for long-horizon sanity
                 t, dream = dreams[-1] 
                 d = _tensor01_to_bgr_u8(dream, 400, 300)
-                cv2.putText(d, f"Dream T+{t}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 255), 2)
+                cv2.putText(d, f"T+{t}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 255), 2)
                 panels.append(d)
             
             vis = np.hstack(panels)
@@ -438,7 +418,6 @@ def main():
                     print("Resetting...")
                     env.reset()
                     buf.clear()
-                    # Refill buffer
                     for _ in range(FRAME_STACK):
                         fr = capture_window(env)
                         if fr is not None: buf.append(_rgb64_u8(fr))
