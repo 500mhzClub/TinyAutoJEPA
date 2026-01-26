@@ -29,10 +29,12 @@ MODEL_PATH_HEADS=./models/latent_heads.pth \
 MODEL_PATH_DEC=./models/decoder_final.pth \
 HORIZON=15 \
 NUM_TENTACLES=512 \
-W_WALL=100.0 \
+W_WALL=500.0 \
 W_OFFROAD=5.0 \
-W_CENTER=2.0 \
+W_CENTER=10.0 \
+ROAD_FLOOR=0.70 \
 W_SPEED=0.8 \
+K_PRIOR=0.5 \
 python drive_mpc.py
 """
 
