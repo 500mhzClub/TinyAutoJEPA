@@ -13,34 +13,27 @@ from collections import deque
 from typing import Dict, Tuple, Optional, List
 
 """
-drive_mpc.py — “Pure latent MPC” for CarRacing-v3
+drive_mpc.py — Vision-Grounded Latent MPC
 
-FINAL CONFIGURATION:
-- Barrier Function Cost (W_WALL) for virtual guardrails.
-- High Density Sampling (256 tentacles).
-- Visualization of the virtual wall boundaries.
+UPDATES:
+- W_OFFROAD is now 5.0 (Grass is bad).
+- W_WALL reduced to 100.0 (Strong barrier, but allows gradient flow).
+- ROAD_FLOOR set to 0.4 (If road probability < 40%, start panicking).
+- PREDICTOR_SPACE matches training config.
 
-# W_WALL=5000.0: Massive penalty for touching the grass logic.
-# W_SPEED=0.5: Reward for speed, but Walls take priority.
-# NUM_TENTACLES=256: Need density to find the "safe" path in the barrier.
+# The cost weights here match the logic in the new script
 PREDICTOR_SPACE=raw \
-HORIZON=10 \
-NUM_TENTACLES=256 \
-K_PRIOR=0.0 \
-W_CENTER=5.0 \
-W_WALL=5000.0 \
-W_OFFROAD=0.0 \
-W_SPEED=0.5 \
-V_BASE=0.0 \
-STEER_SMOOTH=0.1 \
-STEER_MAG_PEN=0.0 \
-INVERT_OUTPUT=0 \
 MODEL_PATH_ENC=./models/encoder_mixed_final.pth \
 MODEL_PATH_PRED=./models/predictor_final.pth \
 MODEL_PATH_HEADS=./models/latent_heads.pth \
 MODEL_PATH_DEC=./models/decoder_final.pth \
+HORIZON=15 \
+NUM_TENTACLES=512 \
+W_WALL=100.0 \
+W_OFFROAD=5.0 \
+W_CENTER=2.0 \
+W_SPEED=0.8 \
 python drive_mpc.py
-
 """
 
 # -----------------------------
@@ -56,10 +49,10 @@ FRAME_STACK = int(os.getenv("FRAME_STACK", "4"))
 PREDICTOR_SPACE = os.getenv("PREDICTOR_SPACE", "raw").lower()
 
 # -----------------------------
-# MPC parameters
+# MPC parameters (FIXED)
 # -----------------------------
-HORIZON = int(os.getenv("HORIZON", "10"))
-NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "256"))
+HORIZON = int(os.getenv("HORIZON", "15"))
+NUM_TENTACLES = int(os.getenv("NUM_TENTACLES", "512")) # More samples for better search
 
 STEER_STD    = float(os.getenv("STEER_STD", "0.5"))
 STEER_DSTD   = float(os.getenv("STEER_DSTD", "0.20"))
@@ -69,23 +62,20 @@ GAS_BASE = float(os.getenv("GAS_BASE", "0.78"))
 GAS_DROP = float(os.getenv("GAS_DROP", "0.45"))
 MIN_GAS  = float(os.getenv("MIN_GAS", "0.22"))
 
-STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.0"))
-STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.0"))
+STEER_MAG_PEN  = float(os.getenv("STEER_MAG_PEN", "0.01")) # Tiny penalty to prefer straight if costs equal
+STEER_JERK_PEN = float(os.getenv("STEER_JERK_PEN", "0.01"))
 STEER_FLIP_PEN = float(os.getenv("STEER_FLIP_PEN", "0.0"))
 
-W_CENTER  = float(os.getenv("W_CENTER", "5.0"))
-W_OFFROAD = float(os.getenv("W_OFFROAD", "0.0")) 
-ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.20"))
-W_SPEED = float(os.getenv("W_SPEED", "0.5"))
+W_CENTER  = float(os.getenv("W_CENTER", "2.0"))   # Gentle centering
+W_OFFROAD = float(os.getenv("W_OFFROAD", "5.0"))  # CRITICAL: Grass cost > 0
+ROAD_FLOOR = float(os.getenv("ROAD_FLOOR", "0.40")) # Tolerates minor edge noise
+W_SPEED = float(os.getenv("W_SPEED", "0.8"))      # Reward speed
 
 # BARRIER: If |x_offset| > 0.30, cost explodes
-W_WALL = float(os.getenv("W_WALL", "5000.0")) 
+# Was 5000.0 (Too stiff), now 100.0 (Strong but manageable)
+W_WALL = float(os.getenv("W_WALL", "100.0")) 
 
-V_BASE  = float(os.getenv("V_BASE", "0.0")) # Let optimizer decide speed mostly
-V_DROP  = float(os.getenv("V_DROP", "0.0"))
-V_MIN   = float(os.getenv("V_MIN", "0.0"))
-
-K_PRIOR = float(os.getenv("K_PRIOR", "0.0"))
+K_PRIOR = float(os.getenv("K_PRIOR", "0.2")) # Use current xoff to bias sampling slightly
 
 DECODE_STEPS = os.getenv("DECODE_STEPS", "2,5,8")
 DECODE_STEPS = [int(x) for x in DECODE_STEPS.split(",") if x.strip()]
@@ -155,8 +145,13 @@ class MLPHead(nn.Module):
 
 @torch.no_grad()
 def heads_eval(head_road, head_spd, head_xoff, feat512):
+    # Road: Trained with BCEWithLogits -> Use Sigmoid to get probability
     road = torch.sigmoid(head_road(feat512))
+    
+    # Speed: Raw MSE -> Identity
     spd  = head_spd(feat512)
+    
+    # XOff: Trained with Tanh*0.5 in mind (see train_latent_heads.py)
     xoff = torch.tanh(head_xoff(feat512)) * 0.5
     return road, spd, xoff
 
@@ -174,16 +169,22 @@ def _pred_step(pred: nn.Module, z_bchw: torch.Tensor, action: torch.Tensor, spee
 def _make_actions(horizon: int, n: int, steer_center: float) -> torch.Tensor:
     n_commit = max(int(n * 0.15), 1)
     n_rand = n - n_commit
-    offsets = torch.tensor([-0.55, -0.35, -0.20, -0.10, 0.0, 0.10, 0.20, 0.35, 0.55], device=DEVICE)
+    
+    # Biased sampling around the 'steer_center' (heuristic from xoff)
+    offsets = torch.tensor([-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5], device=DEVICE)
+    
+    # Commit strategies (constant actions)
     if n_commit < len(offsets):
         idx = torch.randperm(len(offsets), device=DEVICE)[:n_commit]
-        s_commit_vals = torch.clamp(torch.tensor(steer_center, device=DEVICE) + offsets[idx], -1.0, 1.0)
+        s_vals = torch.clamp(steer_center + offsets[idx], -1.0, 1.0)
     else:
-        idx = torch.randint(0, offsets.numel(), (n_commit,), device=DEVICE)
-        s_commit_vals = torch.clamp(torch.tensor(steer_center, device=DEVICE) + offsets[idx], -1.0, 1.0)
+        # Just random fill if we have huge N
+        s_vals = (torch.rand(n_commit, device=DEVICE) * 2 - 1)
     
-    steer_commit = s_commit_vals[:, None].repeat(1, horizon)
-    s0 = torch.randn(n_rand, device=DEVICE) * STEER_STD + float(steer_center)
+    steer_commit = s_vals[:, None].repeat(1, horizon)
+    
+    # Browninan motion / Random Walk
+    s0 = torch.randn(n_rand, device=DEVICE) * STEER_STD + steer_center
     s0 = torch.clamp(s0, -1.0, 1.0)
     ds = torch.randn(n_rand, horizon, device=DEVICE) * STEER_DSTD
 
@@ -194,10 +195,13 @@ def _make_actions(horizon: int, n: int, steer_center: float) -> torch.Tensor:
         steer[:, t] = STEER_SMOOTH * steer[:, t - 1] + (1.0 - STEER_SMOOTH) * proposed
 
     steer_all = torch.cat([steer_commit, steer], dim=0)
+    
+    # Gas logic: slow down when turning hard
     abs_s = torch.abs(steer_all)
     gas = GAS_BASE - GAS_DROP * abs_s
-    gas = torch.clamp(gas, MIN_GAS, 0.95)
+    gas = torch.clamp(gas, MIN_GAS, 1.0)
     brake = torch.zeros_like(gas)
+    
     return torch.stack([steer_all, gas, brake], dim=-1).to(torch.float32)
 
 def load_models():
@@ -206,27 +210,26 @@ def load_models():
     for p in (MODEL_PATH_ENC, MODEL_PATH_PRED, MODEL_PATH_HEADS):
         if not os.path.exists(p): raise FileNotFoundError(p)
 
-    # --- ENCODER LOAD (ROBUST) ---
+    # --- ENCODER ---
     in_ch = 3 * FRAME_STACK
     enc = TinyEncoder(in_ch=in_ch, emb_dim=512).to(DEVICE).eval()
     enc_ckpt = torch.load(MODEL_PATH_ENC, map_location=DEVICE)
-    # Handle nested dict if present, else use direct state_dict
-    if isinstance(enc_ckpt, dict) and "encoder" in enc_ckpt:
-        enc_ckpt = enc_ckpt["encoder"]
+    if isinstance(enc_ckpt, dict) and "encoder" in enc_ckpt: enc_ckpt = enc_ckpt["encoder"]
     enc.load_state_dict(_strip_prefixes(enc_ckpt), strict=False)
 
-    # --- PREDICTOR LOAD (ROBUST) ---
+    # --- PREDICTOR ---
     pred = Predictor().to(DEVICE).eval()
     pred_ckpt = torch.load(MODEL_PATH_PRED, map_location=DEVICE)
-    if isinstance(pred_ckpt, dict) and "predictor" in pred_ckpt: 
-        pred_ckpt = pred_ckpt["predictor"]
+    if isinstance(pred_ckpt, dict) and "predictor" in pred_ckpt: pred_ckpt = pred_ckpt["predictor"]
     pred.load_state_dict(_strip_prefixes(pred_ckpt), strict=False)
 
+    # --- DECODER (Optional) ---
     dec = None
     if MODEL_PATH_DEC and os.path.exists(MODEL_PATH_DEC):
         dec = TinyDecoder().to(DEVICE).eval()
         dec.load_state_dict(torch.load(MODEL_PATH_DEC, map_location=DEVICE), strict=False)
 
+    # --- HEADS ---
     heads_ckpt = torch.load(MODEL_PATH_HEADS, map_location=DEVICE)
     head_road = MLPHead(512, 1).to(DEVICE).eval()
     head_spd  = MLPHead(512, 1).to(DEVICE).eval()
@@ -234,6 +237,7 @@ def load_models():
     head_road.load_state_dict(_strip_prefixes(heads_ckpt["head_road"]), strict=True)
     head_spd.load_state_dict(_strip_prefixes(heads_ckpt["head_spd"]), strict=True)
     head_xoff.load_state_dict(_strip_prefixes(heads_ckpt["head_xoff"]), strict=True)
+    
     return enc, pred, dec, head_road, head_spd, head_xoff
 
 def _ensure_video_writer(path: str, fps: int, fourcc: str, frame_wh: Tuple[int, int]) -> cv2.VideoWriter:
@@ -256,65 +260,77 @@ def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarra
     x_u8 = _stack_to_tensor_u8(stack_u8).to(DEVICE)
     z0_bchw = encoder_latent(enc, x_u8)
     feat0 = pool_feat(z0_bchw)
+    
+    # Assess current state
     road0, spd0, xoff0 = heads_eval(head_road, head_spd, head_xoff, feat0)
+    xoff_val = xoff0.item()
 
-    # Prior Logic
-    steer_center = float(torch.clamp(-K_PRIOR * xoff0.squeeze(0), -0.75, 0.75).item())
-    actions = _make_actions(HORIZON, NUM_TENTACLES, steer_center) 
+    # Prior: If we are to the right (xoff > 0), we want to steer LEFT (negative) to correct.
+    # K_PRIOR steers us back to 0.
+    steer_bias = -K_PRIOR * xoff_val 
+    steer_bias = float(np.clip(steer_bias, -0.5, 0.5))
 
-    # Penalties
+    actions = _make_actions(HORIZON, NUM_TENTACLES, steer_bias) 
+
+    # Action smoothness penalties
     steer = actions[:, :, 0]
     mag_pen  = STEER_MAG_PEN  * torch.mean(torch.abs(steer), dim=1)
     jerk_pen = STEER_JERK_PEN * torch.mean(torch.abs(steer[:, 1:] - steer[:, :-1]), dim=1)
-    flip_pen = STEER_FLIP_PEN * torch.mean((steer[:, 1:] * steer[:, :-1] < 0).float(), dim=1)
-
+    
+    # Dynamics rollout
     z = z0_bchw.repeat(NUM_TENTACLES, 1, 1, 1)
     cost = torch.zeros(NUM_TENTACLES, device=DEVICE)
     dreams: List[Tuple[int, torch.Tensor]] = []
     decode_set = set(DECODE_STEPS)
 
     for t in range(1, HORIZON + 1):
+        # 1. Decode Latent Semantics
         feat_t = pool_feat(z)
         road_t, spd_t, xoff_t = heads_eval(head_road, head_spd, head_xoff, feat_t)
-
-        # --- BARRIER COST FUNCTION ---
-        # Instead of linear cost, we use a "Soft Wall"
-        # x_offset is [-0.5, 0.5]. The road edge is approx +/- 0.35.
-        dist = torch.abs(xoff_t.squeeze(1))
         
-        # 1. Base Centering (Keep it tidy)
+        # 2. Cost Calculation
+        
+        # A. Centerline Cost
+        # Distance from 0.0
+        dist = torch.abs(xoff_t.squeeze(1))
         cost += (W_CENTER * dist) 
         
-        # 2. The Wall (Exponential Penalty near edge)
-        # If dist > 0.3, cost explodes.
-        # 0.25 -> 0 cost, 0.35 -> 100 cost, 0.45 -> 10000 cost
-        in_danger = torch.relu(dist - 0.25) 
+        # B. Soft Wall (Barrier)
+        # If dist > 0.35 (Edge of track roughly), penalty spikes.
+        # This keeps car within [-0.35, 0.35]
+        in_danger = torch.relu(dist - 0.30) 
         cost += (W_WALL * (in_danger ** 2))
-        # -----------------------------
 
-        cost += (W_OFFROAD * torch.relu(ROAD_FLOOR - road_t.squeeze(1)))
+        # C. Offroad Cost
+        # If road_t < 0.4, we are likely on grass.
+        # Use ReLU so we only penalize low roadness.
+        is_grass = torch.relu(ROAD_FLOOR - road_t.squeeze(1))
+        cost += (W_OFFROAD * is_grass)
         
-        # Speed Reward (Negative cost = Reward)
-        # We want to be FAST, but not if it hits the wall.
+        # D. Speed Reward
+        # Negative cost.
         cost -= (W_SPEED * spd_t.squeeze(1))
 
-        # Standard Prediction (Trusting standard physics)
+        # 3. Next State
         a_t = actions[:, t - 1, :]
         z = _pred_step(pred, z, a_t, spd_t.squeeze(1))
         if PREDICTOR_SPACE == "norm": z = _l2norm_bchw(z)
 
+        # 4. Save visualization frame
         if dec is not None and t in decode_set:
             dreams.append((t, z))
 
-    score = -(cost + mag_pen + jerk_pen + flip_pen)
+    score = -(cost + mag_pen + jerk_pen)
     best = torch.argmax(score).item()
     a0 = actions[best, 0].detach().cpu().numpy()
 
+    # Reconstruction for debug
     recon = None
     if dec is not None:
         try: recon = torch.clamp(dec(z0_bchw), 0, 1)
         except: pass
 
+    # Extract dreams for best path
     dream_imgs = []
     if dec is not None and dreams:
         for (t, z_batch) in dreams:
@@ -325,12 +341,10 @@ def mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack_u8: np.ndarra
             except: pass
 
     dbg = {
-        "steer_center": steer_center,
+        "xoff0": xoff_val,
         "road0": float(road0.item()),
         "spd0": float(spd0.item()),
-        "xoff0": float(xoff0.item()),
-        "score_best": float(score[best].item()),
-        "cost_best": float(cost[best].item()),
+        "best_cost": float(cost[best].item())
     }
     return a0, dbg, recon, dream_imgs
 
@@ -341,15 +355,18 @@ def main():
     out_path = os.path.join(VIDEO_DIR, VIDEO_OUT)
 
     env.reset()
-    env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
+    # Initial kick to start car
+    env.step(np.array([0.0, 1.0, 0.0], dtype=np.float32))
 
     buf = deque(maxlen=FRAME_STACK)
+    # Fill buffer
     for _ in range(FRAME_STACK):
         fr = capture_window(env)
         if fr is not None: buf.append(_rgb64_u8(fr))
         env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
     
-    for _ in range(10): 
+    # Warmup
+    for _ in range(20): 
         env.step(np.array([0.0, 0.5, 0.0], dtype=np.float32))
         fr = capture_window(env)
         if fr is not None: buf.append(_rgb64_u8(fr))
@@ -364,6 +381,7 @@ def main():
             if frame is None:
                 env.step(last_action)
                 continue
+            
             buf.append(_rgb64_u8(frame))
             if len(buf) < FRAME_STACK:
                 env.step(last_action)
@@ -373,58 +391,56 @@ def main():
             with amp_ctx:
                 a0, dbg, recon, dreams = mpc_step(enc, pred, dec, head_road, head_spd, head_xoff, stack)
 
-            # Standard Action
             last_action = a0.astype(np.float32)
-            
             _, _, terminated, truncated, _ = env.step(last_action)
             step_i += 1
 
-            if DEBUG_PRINT and (step_i % 20 == 0):
-                print(f"step={step_i:05d} steer={last_action[0]:+.3f} | xoff={dbg['xoff0']:+.3f}")
+            if DEBUG_PRINT and (step_i % 10 == 0):
+                print(f"step={step_i:05d} | steer={last_action[0]:+.2f} gas={last_action[1]:.2f} | xoff={dbg['xoff0']:+.2f} road={dbg['road0']:.2f}")
 
-            # --- HUD VISUALIZATION ---
+            # --- HUD ---
             vis_real = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             vis_real = cv2.resize(vis_real, (400, 300), interpolation=cv2.INTER_AREA)
             
-            # Draw Barrier Bars
-            # Center of image is 200. Full width is -0.5 to 0.5
-            # Scale: 1.0 unit = 400 pixels width? No, that's too wide.
-            # Let's say -0.5=0px, 0.0=200px, +0.5=400px.
+            # Gauge: X Offset
+            # Center (200) is 0.0. Range +/- 0.5 maps to +/- 200px (Full width)
+            cx = int(200 + (dbg['xoff0'] * 400))
+            cv2.line(vis_real, (200, 260), (200, 290), (255, 255, 255), 1) # Center Ref
+            cv2.circle(vis_real, (cx, 275), 6, (0, 0, 255) if abs(dbg['xoff0'])>0.3 else (0, 255, 0), -1)
             
-            x_curr = int(200 + (dbg['xoff0'] * 400))
-            cv2.line(vis_real, (x_curr, 280), (x_curr, 300), (0, 255, 0), 4) # Car Pos
-            
-            # Draw Walls at +/- 0.3
-            w_left = int(200 - (0.3 * 400))
-            w_rght = int(200 + (0.3 * 400))
-            cv2.line(vis_real, (w_left, 280), (w_left, 300), (0, 0, 255), 2)
-            cv2.line(vis_real, (w_rght, 280), (w_rght, 300), (0, 0, 255), 2)
-            
+            # Gauge: Road Confidence
+            rw = int(dbg['road0'] * 100)
+            cv2.rectangle(vis_real, (10, 10), (10+rw, 25), (0, 255, 255), -1)
+            cv2.putText(vis_real, f"ROAD", (120, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
             panels = [vis_real]
             if recon is not None:
                 r = _tensor01_to_bgr_u8(recon, 400, 300)
                 panels.append(r)
             if dreams:
-                t, dream = dreams[0]
+                # Show furthest dream for long-horizon sanity
+                t, dream = dreams[-1] 
                 d = _tensor01_to_bgr_u8(dream, 400, 300)
-                cv2.putText(d, f"PRED t+{t}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 255), 2)
+                cv2.putText(d, f"Dream T+{t}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 255), 2)
                 panels.append(d)
             
             vis = np.hstack(panels)
-            cv2.putText(vis, f"XOFF: {dbg['xoff0']:+.2f}", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            cv2.imshow("Fast MPC (Barrier Function)", vis)
+            cv2.imshow("MPC Grounded", vis)
+            
             if RECORD:
                 if vw is None: vw = _ensure_video_writer(out_path, VIDEO_FPS, VIDEO_FOURCC, (vis.shape[1], vis.shape[0]))
                 vw.write(vis)
+                
             if (cv2.waitKey(1) == 27) or terminated or truncated:
-                if terminated or truncated: env.reset()
-                buf.clear()
-                for _ in range(FRAME_STACK):
-                    fr = capture_window(env)
-                    if fr is not None: buf.append(_rgb64_u8(fr))
-                    env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
-                last_action[:] = 0.0
+                if terminated or truncated: 
+                    print("Resetting...")
+                    env.reset()
+                    buf.clear()
+                    # Refill buffer
+                    for _ in range(FRAME_STACK):
+                        fr = capture_window(env)
+                        if fr is not None: buf.append(_rgb64_u8(fr))
+                        env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
     finally:
         try: env.close()
         except: pass
