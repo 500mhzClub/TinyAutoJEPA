@@ -160,3 +160,11 @@ python drive_mpc.py
 
 
 5. **Action:** The system executes the first action of the sequence with the lowest cumulative energy.
+
+### MPC Demo
+
+<video src="run_mpc.mp4" width="800" controls>
+  Your browser does not support embedded videos.
+  You can <a href="run_mpc.mp4">download and watch the demo here</a>.
+  
+</video>
