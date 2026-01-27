@@ -4,6 +4,10 @@ TinyAutoJEPA is an autonomous driving system based on Joint Embedding Predictive
 
 Unlike standard Imitation Learning, which clones human actions directly, this system builds a "World Model" (an internal representation of physics and causality). It learns to distinguish surface properties (e.g., grass vs. road) and predicts future states based on current actions before being tasked with driving.
 
+## High-Level Diagram
+
+![High-Level Architecture](high-level-diagram.png)
+
 
 ## Dataset Strategy
 
