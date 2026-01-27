@@ -78,7 +78,7 @@ run_until_target () {
 
     local rem=$(( target - cur ))
     echo "[INFO] $mode: current=$cur target=$target remaining=$rem"
-    echo "[RUN] python collect_data.py --mode $mode --out_dir $outdir --workers $WORKERS --episodes_total $batch --steps $STEPS --no_compress ${extra_args[*]}"
+    echo "[RUN] python collect_data.py --mode $mode --out_dir $outdir --workers $WORKERS --episodes_total $batch --steps $STEPS --save_metrics --no_compress ${extra_args[*]}"
 
     python collect_data.py \
       --mode "$mode" \
