@@ -1,7 +1,19 @@
 # --- Large Data Files (DO NOT COMMIT) ---
-# These are your dataset and model weights. They are too big for GitHub.
-data/
-*.npz
+# Large datasets and weights. Keep Python scripts in python/data/ tracked.
+python/data/*.npz
+python/data/*.npy
+python/data/*.pt
+python/data/*.pth
+python/data/*.ckpt
+python/data/*.onnx
+python/data/*.zip
+python/data_*/*.npz
+python/data_*/*.npy
+python/data_*/*.pt
+python/data_*/*.pth
+python/data_*/*.ckpt
+python/data_*/*.onnx
+python/data_*/*.zip
 *.pt
 *.pth
 *.ckpt
