@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 import glob
 import random
 from typing import Dict, Any, Optional, Tuple
@@ -11,7 +13,13 @@ import cv2
 import torch
 import torch.nn.functional as F
 
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(_ROOT / "train"))
+
 from networks import TinyEncoder, Predictor, TinyDecoder
+
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 # -----------------------------
 # Config
@@ -26,11 +34,11 @@ assert PREDICTOR_SPACE in ("raw", "norm")
 
 DEVICE = torch.device(os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
 
-ENCODER_PATH = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
-PREDICTOR_PATH = os.getenv("PREDICTOR_PATH", "./models/predictor_final.pth")
-DECODER_PATH = os.getenv("DECODER_PATH", "./models/decoder_final.pth")
+ENCODER_PATH = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
+PREDICTOR_PATH = os.getenv("PREDICTOR_PATH", _p("models/predictor_final.pth"))
+DECODER_PATH = os.getenv("DECODER_PATH", _p("models/decoder_final.pth"))
 
-DATA_GLOB_1 = os.getenv("DATA_GLOB_1", "./data_expert/*.npz")
+DATA_GLOB_1 = os.getenv("DATA_GLOB_1", f"{_ROOT}/data_expert/*.npz")
 
 OUT_DIR = os.getenv("OUT_DIR", ".")
 FPS = int(os.getenv("FPS", "20"))

@@ -7,9 +7,13 @@ drive_mpc.py — Single Run & Video Recording
 - Stops immediately upon crash or finish.
 - Saves 'run_mpc.mp4'.
 - Config: "Best Yet" (Low Tentacles, High Stability).
+
+QT_QPA_PLATFORM=xcb HSA_OVERRIDE_GFX_VERSION=11.0.0 MODEL_PATH_HEADS="./models/latent_heads_lookahead.pth" HORIZON=15 FRAME_STACK=4 STARTUP_ACTION="0.0,0.35,0.0" STARTUP_NO_MPC_STEPS=50 PROBE_GAS=0.60 PROBE_STEER_THRESH=0.80 PROBE_XOFF_GAIN=5.5 PROBE_XOFF_CAP=0.40 PROBE_FF_BLEND=0.20 PROBE_XOFF_T=6 PROBE_CURVE_THRESH=0.18 PROBE_STEER_GAIN=0.50 SPEED_TARGET=42.0 W_SPEED_CAP=0.12 SPD_LIMIT=120.0 GAS_BASE=0.40 MIN_GAS=0.30 GAS_DROP=0.80 GAS_MAX_HIGHSPD=0.45 BRAKE_MIN_HIGHSPD=0.10 EMA_BETA=0.94 K_PRIOR=0.65 W_CENTER=10.0 EARLY_CENTER=1.4 XOFF_DEADBAND=0.07 STRAIGHT_XOFF=0.07 W_STRAIGHT_STEER=18.0 STEER_GUARD_BLEND=0.75 STEER_SMOOTH=0.85 STEER_STD=0.18 STEER_DSTD=0.04 ACTION_BLEND=0.60 STEER_FLIP_PEN=1.2 STEER_JERK_PEN=0.6 STEER_MAG_PEN=3.5 ACTION_REPEAT=2 MPPI_TEMP=3.5 TEMPLATE_FRACTION=1.0 NUM_TENTACLES=4 DEBUG_PRINT=1 DEBUG_EVERY=10 python drive_mpc.py
 """
 
 import os
+import sys
+from pathlib import Path
 import cv2
 import gymnasium as gym
 import numpy as np
@@ -20,6 +24,12 @@ import torch.nn.functional as F
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple
+
+_BASE_DIR = Path(__file__).resolve().parent
+if (_BASE_DIR / "train").exists():
+    sys.path.append(str(_BASE_DIR / "train"))
+else:
+    sys.path.append(str(_BASE_DIR.parent / "train"))
 
 from networks import TinyEncoder, Predictor, TinyDecoder
 
@@ -42,11 +52,17 @@ def _env_str(name: str, default: str) -> str:
 
 # -----------------------------
 # Paths / Device
+_ROOT = _BASE_DIR
+if not (_ROOT / "models").exists():
+    _ROOT = _ROOT.parent
+
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 # -----------------------------
-MODEL_PATH_ENC   = _env_str("MODEL_PATH_ENC",   "./models/encoder_mixed_final.pth")
-MODEL_PATH_PRED  = _env_str("MODEL_PATH_PRED",  "./models/predictor_final.pth")
-MODEL_PATH_DEC   = _env_str("MODEL_PATH_DEC",   "./models/decoder_final.pth")
-MODEL_PATH_HEADS = _env_str("MODEL_PATH_HEADS", "./models/latent_heads_lookahead.pth")
+MODEL_PATH_ENC   = _env_str("MODEL_PATH_ENC",   _p("models/encoder_mixed_final.pth"))
+MODEL_PATH_PRED  = _env_str("MODEL_PATH_PRED",  _p("models/predictor_final.pth"))
+MODEL_PATH_DEC   = _env_str("MODEL_PATH_DEC",   _p("models/decoder_final.pth"))
+MODEL_PATH_HEADS = _env_str("MODEL_PATH_HEADS", _p("models/latent_heads_lookahead.pth"))
 
 DEVICE = torch.device(_env_str("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
 FRAME_STACK = _env_int("FRAME_STACK", 4)
@@ -59,7 +75,7 @@ SPD_SCALE_HEAD = _env_float("SPD_SCALE_HEAD", 80.0)
 # MPC / Sampling parameters ("Best Yet")
 # -----------------------------
 HORIZON = _env_int("HORIZON", 12)
-NUM_TENTACLES = _env_int("NUM_TENTACLES", 6)        # Low latency
+NUM_TENTACLES = _env_int("NUM_TENTACLES", 10)        # Low latency
 TEMPLATE_FRACTION = _env_float("TEMPLATE_FRACTION", 1.0) # Smooth curves only
 
 MPPI_TEMP = _env_float("MPPI_TEMP", 2.5)
@@ -753,7 +769,11 @@ def main():
 
     # VIDEO WRITER SETUP
     video_writer = None
-    video_path = "run_mpc.mp4"
+    _media_dir = _ROOT.parent / "media"
+    if _media_dir.exists():
+        video_path = str(_media_dir / "run_mpc.mp4")
+    else:
+        video_path = str(_ROOT / "run_mpc.mp4")
     print(f"Recording run to {video_path} ...")
 
     try:

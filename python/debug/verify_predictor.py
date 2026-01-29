@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 import glob
 import random
 from dataclasses import dataclass
@@ -15,7 +17,13 @@ from torchvision.utils import save_image
 
 cv2.setNumThreads(0)
 
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(_ROOT / "train"))
+
 from networks import TinyEncoder, TinyDecoder, Predictor
+
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 
 # -----------------------------
@@ -23,12 +31,12 @@ from networks import TinyEncoder, TinyDecoder, Predictor
 # -----------------------------
 @dataclass
 class CFG:
-    encoder_path: str = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
-    decoder_path: str = os.getenv("DECODER_PATH", "./models/decoder_final.pth")
-    predictor_path: str = os.getenv("PRED_PATH", "./models/predictor_final.pth")
+    encoder_path: str = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
+    decoder_path: str = os.getenv("DECODER_PATH", _p("models/decoder_final.pth"))
+    predictor_path: str = os.getenv("PRED_PATH", _p("models/predictor_final.pth"))
 
-    data_glob: str = os.getenv("DATA_GLOB", "./data_expert/*.npz")
-    out_dir: str = os.getenv("OUT_DIR", "./visuals")
+    data_glob: str = os.getenv("DATA_GLOB", f"{_ROOT}/data_expert/*.npz")
+    out_dir: str = os.getenv("OUT_DIR", _p("media/visuals"))
 
     img_size: int = int(os.getenv("IMG_SIZE", "64"))
     frame_stack: int = int(os.getenv("FRAME_STACK", "4"))

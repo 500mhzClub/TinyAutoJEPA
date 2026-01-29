@@ -2,11 +2,13 @@ import numpy as np
 import cv2
 import glob
 import os
+from pathlib import Path
 import random
 from tqdm import tqdm
 
 # --- Config ---
-DIRS_TO_CHECK = ["./data_recover", "./data_expert", "./data_random"]
+_ROOT = Path(__file__).resolve().parents[1]
+DIRS_TO_CHECK = [str(_ROOT / "data_recover"), str(_ROOT / "data_expert"), str(_ROOT / "data_random")]
 SAMPLES_PER_FOLDER = 5  # Check 5 random files per folder
 FRAMES_TO_SHOW = 8      # Show 8 frames from each file
 OUTPUT_DIR = "data_inspection"

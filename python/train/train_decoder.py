@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import glob
 import math
 import random
@@ -20,6 +21,10 @@ from tqdm import tqdm
 
 from networks import TinyEncoder, TinyDecoder
 
+_ROOT = Path(__file__).resolve().parents[1]
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
+
 # Prevent OpenCV from spawning threads inside workers (critical for stalls)
 cv2.setNumThreads(0)
 
@@ -30,7 +35,7 @@ cv2.setNumThreads(0)
 @dataclass
 class CFG:
     # Data
-    data_glob: str = os.getenv("DATA_GLOB", "./data_*/*.npz")
+    data_glob: str = os.getenv("DATA_GLOB", f"{_ROOT}/data_*/*.npz")
     img_size: int = int(os.getenv("IMG_SIZE", "64"))
     frame_stack: int = int(os.getenv("FRAME_STACK", "4"))  # MUST match encoder training
 
@@ -54,13 +59,13 @@ class CFG:
     drop_last: bool = os.getenv("DROP_LAST", "0") == "1"
 
     # I/O
-    encoder_path: str = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
+    encoder_path: str = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
 
     # Use optimizer-state resume by default (as requested)
-    resume_path: str = os.getenv("DECODER_RESUME", "./models/decoder_ckpt_latest.pt")
+    resume_path: str = os.getenv("DECODER_RESUME", _p("models/decoder_ckpt_latest.pt"))
 
-    out_final: str = os.getenv("DECODER_OUT", "./models/decoder_final.pth")
-    visuals_dir: str = os.getenv("VISUALS_DIR", "./visuals")
+    out_final: str = os.getenv("DECODER_OUT", _p("models/decoder_final.pth"))
+    visuals_dir: str = os.getenv("VISUALS_DIR", _p("media/visuals"))
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
     save_visuals_every_epochs: int = int(os.getenv("SAVE_VIS_EVERY_EPOCHS", "1"))
     keep_epoch_ckpts: int = int(os.getenv("KEEP_EPOCH_CKPTS", "5"))  # keep last K decoder_ckpt_ep*.pt
@@ -276,7 +281,7 @@ def _save_decoder_ckpt(path: str, decoder: nn.Module, optimizer: optim.Optimizer
 def _prune_old_epoch_ckpts(keep_last_k: int) -> None:
     if keep_last_k <= 0:
         return
-    ckpts = sorted(glob.glob("./models/decoder_ckpt_ep*.pt"), key=_epoch_from_name)
+    ckpts = sorted(glob.glob(f"{_ROOT}/models/decoder_ckpt_ep*.pt"), key=_epoch_from_name)
     if len(ckpts) <= keep_last_k:
         return
     for p in ckpts[:-keep_last_k]:
@@ -295,7 +300,7 @@ def train() -> None:
 
     _safe_makedirs(os.path.dirname(CFG.out_final))
     _safe_makedirs(CFG.visuals_dir)
-    _safe_makedirs("./models")
+    _safe_makedirs(_p("models"))
 
     # Optional: speed up conv selection
     try:
@@ -437,12 +442,12 @@ def train() -> None:
         # Checkpoint
         if (epoch + 1) % CFG.save_every_epochs == 0:
             # Weights-only (compat)
-            torch.save(decoder.state_dict(), f"./models/decoder_ep{epoch+1}.pth")
-            torch.save(decoder.state_dict(), "./models/decoder_latest.pth")
+            torch.save(decoder.state_dict(), _p(f"models/decoder_ep{epoch+1}.pth"))
+            torch.save(decoder.state_dict(), _p("models/decoder_latest.pth"))
 
             # Full resume (decoder + optimizer + epoch_done)
-            _save_decoder_ckpt("./models/decoder_ckpt_latest.pt", decoder, opt, epoch_done=epoch + 1)
-            _save_decoder_ckpt(f"./models/decoder_ckpt_ep{epoch+1}.pt", decoder, opt, epoch_done=epoch + 1)
+            _save_decoder_ckpt(_p("models/decoder_ckpt_latest.pt"), decoder, opt, epoch_done=epoch + 1)
+            _save_decoder_ckpt(_p(f"models/decoder_ckpt_ep{epoch+1}.pt"), decoder, opt, epoch_done=epoch + 1)
             _prune_old_epoch_ckpts(CFG.keep_epoch_ckpts)
 
     torch.save(decoder.state_dict(), CFG.out_final)

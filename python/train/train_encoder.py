@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import glob
 import re
 import random
@@ -16,6 +17,10 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from networks import TinyEncoder, Projector
+
+_ROOT = Path(__file__).resolve().parents[1]
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 from vicreg import vicreg_loss
 
 
@@ -25,9 +30,9 @@ from vicreg import vicreg_loss
 @dataclass
 class CFG:
     # Data
-    data_random: str = os.getenv("DATA_RANDOM", "./data_random")
-    data_expert: str = os.getenv("DATA_EXPERT", "./data_expert")
-    data_recover: str = os.getenv("DATA_RECOVER", "./data_recover")
+    data_random: str = os.getenv("DATA_RANDOM", _p("data_random"))
+    data_expert: str = os.getenv("DATA_EXPERT", _p("data_expert"))
+    data_recover: str = os.getenv("DATA_RECOVER", _p("data_recover"))
 
     # Training
     batch_size: int = int(os.getenv("BATCH_SIZE", "2048"))
@@ -75,7 +80,7 @@ class CFG:
     async_compile: bool = os.getenv("ASYNC_COMPILE", "0") == "1"
 
     # Checkpointing / validation
-    model_dir: str = os.getenv("MODEL_DIR", "./models")
+    model_dir: str = os.getenv("MODEL_DIR", _p("models"))
     resume: bool = os.getenv("RESUME", "1") == "1"
     resume_load_optimizer: bool = os.getenv("RESUME_LOAD_OPTIMIZER", "1") == "1"
     save_every_epochs: int = int(os.getenv("SAVE_EVERY_EPOCHS", "1"))
@@ -145,7 +150,7 @@ class FastRAMDataset(Dataset):
         super().__init__()
         files = _list_npz(CFG.data_random) + _list_npz(CFG.data_expert) + _list_npz(CFG.data_recover)
         if not files:
-            files = sorted(glob.glob("./data_*/*.npz"))
+            files = sorted(glob.glob(f"{_ROOT}/data_*/*.npz"))
         if not files:
             raise RuntimeError("No .npz files found. Set DATA_RANDOM/DATA_EXPERT/DATA_RECOVER.")
 

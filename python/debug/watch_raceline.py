@@ -5,6 +5,7 @@ from stable_baselines3.common.vec_env import VecFrameStack, VecVideoRecorder
 import numpy as np
 import cv2
 import os
+from pathlib import Path
 
 # --- FIX 1: Silence the Qt/Wayland warning ---
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -14,7 +15,8 @@ MODELS_TO_TEST = [
     ("Perfected", "ppo_carracing_v3_perfected.zip") 
 ]
 N_EPISODES = 3
-VIDEO_FOLDER = "./videos/"
+_ROOT = Path(__file__).resolve().parents[1]
+VIDEO_FOLDER = str(_ROOT / "media")
 RENDER_LIVE = True 
 
 def evaluate(model_name, model_path):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import glob
 import random
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from networks import TinyEncoder
+
+_ROOT = Path(__file__).resolve().parents[1]
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 """
 train_latent_heads_lookahead_proper.py
@@ -49,8 +54,8 @@ python train_latent_heads_lookahead_proper.py
 @dataclass
 class CFG:
     # I/O
-    encoder_path: str = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
-    out_path: str = os.getenv("HEADS_OUT", "./models/latent_heads_lookahead.pth")
+    encoder_path: str = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
+    out_path: str = os.getenv("HEADS_OUT", _p("models/latent_heads_lookahead.pth"))
 
     # Device
     device: str = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -68,7 +73,7 @@ class CFG:
     grad_clip: float = float(os.getenv("GRAD_CLIP", "1.0"))
 
     # Data
-    data_glob: str = os.getenv("DATA_GLOB", "./data_*/*.npz")
+    data_glob: str = os.getenv("DATA_GLOB", f"{_ROOT}/data_*/*.npz")
     num_workers: int = int(os.getenv("NUM_WORKERS", "8"))
     stride: int = int(os.getenv("STRIDE", "4"))
     buffer_size: int = int(os.getenv("BUFFER_SIZE", "400"))

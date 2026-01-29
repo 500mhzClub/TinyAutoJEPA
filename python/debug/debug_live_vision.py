@@ -3,12 +3,20 @@ import torch
 import numpy as np
 import cv2
 import os
+import sys
+from pathlib import Path
 import pygame 
+_BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.append(str(_BASE_DIR / "train"))
+
 from networks import TinyEncoder, TinyDecoder
 
+def _p(rel: str) -> str:
+    return str(_BASE_DIR / rel)
+
 # --- CONFIG ---
-ENC_PATH = "./models/encoder_mixed_final.pth"
-DEC_PATH = "./models/decoder_final.pth"
+ENC_PATH = _p("models/encoder_mixed_final.pth")
+DEC_PATH = _p("models/decoder_final.pth")
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_models():

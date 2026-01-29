@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import glob
 import random
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from networks import TinyEncoder, Predictor, TinyDecoder
+
+_ROOT = Path(__file__).resolve().parents[1]
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 # ==========================================
 # FRESH START COMMAND (FUTURE USE)
@@ -55,8 +60,8 @@ class CFG:
     frame_stack: int = int(os.getenv("FRAME_STACK", "4"))  # must match encoder training
     img_size: int = int(os.getenv("IMG_SIZE", "64"))
 
-    encoder_path: str = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
-    decoder_path: str = os.getenv("DECODER_PATH", "./models/decoder_final.pth")
+    encoder_path: str = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
+    decoder_path: str = os.getenv("DECODER_PATH", _p("models/decoder_final.pth"))
 
     # IMPORTANT: keep aligned with MPC
     # raw  => predictor learns raw BCHW latents (recommended if MPC uses raw)
@@ -503,9 +508,10 @@ def save_dream_rollout(encoder: TinyEncoder, predictor: Predictor, decoder: Tiny
     strip_dream = torch.cat(dreams, dim=2)
     viz = torch.cat([strip_gt, strip_dream], dim=1)
     
-    os.makedirs("viz_predictor", exist_ok=True)
-    save_image(viz, f"viz_predictor/epoch_{epoch:03d}.png")
-    print(f"[viz] Saved dream rollout to viz_predictor/epoch_{epoch:03d}.png")
+    viz_dir = _p("media/viz_predictor")
+    os.makedirs(viz_dir, exist_ok=True)
+    save_image(viz, os.path.join(viz_dir, f"epoch_{epoch:03d}.png"))
+    print(f"[viz] Saved dream rollout to {os.path.join(viz_dir, f'epoch_{epoch:03d}.png')}")
 
 
 # -----------------------------
@@ -515,11 +521,11 @@ def train() -> None:
     seed_all(CFG.seed)
     os.makedirs("models", exist_ok=True)
 
-    files = sorted(glob.glob("./data_*/*.npz"))
+    files = sorted(glob.glob(f"{_ROOT}/data_*/*.npz"))
     if CFG.max_files and CFG.max_files > 0:
         files = files[: CFG.max_files]
     if not files:
-        raise RuntimeError("No .npz files found under ./data_*/*.npz")
+        raise RuntimeError(f"No .npz files found under {_ROOT}/data_*/*.npz")
 
     rng = random.Random(CFG.seed)
     rng.shuffle(files)
@@ -709,8 +715,8 @@ def train() -> None:
         scheduler.step()
 
         if (epoch + 1) % 5 == 0:
-            ckpt_state = f"models/predictor_ep{epoch+1}.pth"
-            ckpt_meta = f"models/predictor_ep{epoch+1}_meta.pth"
+            ckpt_state = _p(f"models/predictor_ep{epoch+1}.pth")
+            ckpt_meta = _p(f"models/predictor_ep{epoch+1}_meta.pth")
             torch.save(predictor.state_dict(), ckpt_state)
             torch.save(
                 {
@@ -734,7 +740,7 @@ def train() -> None:
             validate(encoder, predictor, val_loader)
             save_dream_rollout(encoder, predictor, decoder, val_loader, epoch+1)
 
-    torch.save(predictor.state_dict(), "models/predictor_final.pth")
+    torch.save(predictor.state_dict(), _p("models/predictor_final.pth"))
     print("[train] done.")
 
 if __name__ == "__main__":

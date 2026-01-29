@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 import glob
 import random
 from dataclasses import dataclass
@@ -18,7 +20,13 @@ from tqdm import tqdm
 
 cv2.setNumThreads(0)
 
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(_ROOT / "train"))
+
 from networks import TinyEncoder, TinyDecoder
+
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 
 # -----------------------------
@@ -27,7 +35,7 @@ from networks import TinyEncoder, TinyDecoder
 @dataclass
 class CFG:
     # Data
-    data_glob: str = os.getenv("DATA_GLOB", "./data_*/*.npz")
+    data_glob: str = os.getenv("DATA_GLOB", f"{_ROOT}/data_*/*.npz")
     img_size: int = int(os.getenv("IMG_SIZE", "64"))
     frame_stack: int = int(os.getenv("FRAME_STACK", "4"))
 
@@ -41,11 +49,11 @@ class CFG:
     drop_last: bool = os.getenv("DROP_LAST", "1") == "1"
 
     # Paths
-    encoder_path: str = os.getenv("ENCODER_PATH", "./models/encoder_mixed_final.pth")
-    decoder_latest: str = os.getenv("DECODER_LATEST", "./models/decoder_latest.pth")
-    out_dir_models: str = os.getenv("MODEL_DIR", "./models")
-    out_dir_visuals: str = os.getenv("VIS_DIR", "./visuals")
-    final_decoder_path: str = os.getenv("DECODER_FINAL", "./models/decoder_final.pth")
+    encoder_path: str = os.getenv("ENCODER_PATH", _p("models/encoder_mixed_final.pth"))
+    decoder_latest: str = os.getenv("DECODER_LATEST", _p("models/decoder_latest.pth"))
+    out_dir_models: str = os.getenv("MODEL_DIR", _p("models"))
+    out_dir_visuals: str = os.getenv("VIS_DIR", _p("media/visuals"))
+    final_decoder_path: str = os.getenv("DECODER_FINAL", _p("models/decoder_final.pth"))
 
     # AMP
     amp: bool = os.getenv("AMP", "1") == "1"

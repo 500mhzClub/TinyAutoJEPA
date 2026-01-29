@@ -1,14 +1,19 @@
 import gymnasium as gym
+import sys
+from pathlib import Path
 import torch
 import numpy as np
 import cv2
 import pygame
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(_ROOT / "train"))
+
 from networks import TinyEncoder, Predictor, TinyDecoder
 
 # --- CONFIG ---
-MODEL_PATH_ENC    = "./models/encoder_mixed_final.pth"
-MODEL_PATH_PRED   = "./models/predictor_multistep_final.pth"
-MODEL_PATH_DEC    = "./models/decoder_parallel_ep40.pth"
+MODEL_PATH_ENC    = str(_ROOT / "models/encoder_mixed_final.pth")
+MODEL_PATH_PRED   = str(_ROOT / "models/predictor_multistep_final.pth")
+MODEL_PATH_DEC    = str(_ROOT / "models/decoder_parallel_ep40.pth")
 DEVICE            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PRED_HORIZON      = 5
 
