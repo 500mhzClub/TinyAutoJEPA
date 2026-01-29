@@ -5,16 +5,21 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import glob
 import os
+from pathlib import Path
 import cv2
 from tqdm import tqdm
 from networks import TinyEncoder, CostModel
+
+_ROOT = Path(__file__).resolve().parents[1]
+def _p(rel: str) -> str:
+    return str(_ROOT / rel)
 
 # --- CONFIG ---
 BATCH_SIZE = 128
 EPOCHS = 10
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ENCODER_PATH = "./models/encoder_mixed_final.pth"
+ENCODER_PATH = _p("models/encoder_mixed_final.pth")
 
 class DiscriminatorDataset(Dataset):
     def __init__(self):
@@ -22,13 +27,13 @@ class DiscriminatorDataset(Dataset):
         self.labels = []
         
         # 1. Load POSITIVE samples (Expert/Race Data) -> Label 0 (Low Energy)
-        race_files = glob.glob("./data_race/*.npz")
+        race_files = glob.glob(f"{_ROOT}/data_race/*.npz")
         print(f"Loading {len(race_files)} Expert files (Label 0)...")
         self._load_files(race_files, label=0.0)
         
         # 2. Load NEGATIVE samples (Random Data) -> Label 1 (High Energy)
         # We limit random files to match race files to keep classes balanced
-        rand_files = glob.glob("./data/*.npz")[:len(race_files)]
+        rand_files = glob.glob(f"{_ROOT}/data/*.npz")[:len(race_files)]
         print(f"Loading {len(rand_files)} Random files (Label 1)...")
         self._load_files(rand_files, label=1.0)
         
@@ -100,7 +105,7 @@ def train():
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             
-    torch.save(cost_model.state_dict(), "./models/cost_model_final.pth")
+    torch.save(cost_model.state_dict(), _p("models/cost_model_final.pth"))
     print("Cost Model Saved.")
 
 if __name__ == "__main__":
