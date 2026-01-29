@@ -5,6 +5,10 @@ It learns a **world model** from observations and predicts future states under a
 
 This repository is organized around a `python/` workspace with training, data tooling, and runtime scripts.
 
+High-level architecture:
+
+![High-Level Architecture](media/high-level-diagram.png)
+
 
 ## Repository Layout
 
@@ -29,6 +33,10 @@ python python/drive_mpc.py
 ```
 
 `drive_mpc.py` writes a video to `media/run_mpc.mp4` (if `media/` exists) and opens a visualization window.
+
+MPC run (latest):
+
+![MPC Run](media/run_mpc.gif)
 
 
 ## Data Collection
@@ -66,10 +74,18 @@ python python/train/train_encoder.py
 python python/train/train_decoder.py
 ```
 
+Reconstruction example (decoder sanity check):
+
+![Reconstruction Epoch 43](media/reconstruct_ep43.png)
+
 3) **Predictor (multi-step latent dynamics)**
 ```
 python python/train/train_predictor.py
 ```
+
+Predictor dream rollout:
+
+![Dream Visualization](media/output_dream.gif)
 
 4) **Latent Heads (road / xoff / speed)**
 ```
@@ -127,4 +143,3 @@ Dependencies are listed in `requirements.txt`. Some tools require optional packa
 - Most scripts accept environment variables for configuration.  
 - Paths are resolved relative to `python/` and `media/` automatically.
 - If you move folders, update the `_ROOT` helpers in each script accordingly.
-
